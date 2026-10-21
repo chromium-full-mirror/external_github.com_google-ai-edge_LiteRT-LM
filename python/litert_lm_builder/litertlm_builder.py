@@ -259,11 +259,31 @@ class TfLiteModelType(enum.Enum):
 
 @dataclasses.dataclass(frozen=True)
 class ExternalizationSummary:
-  """Summary of an opt-in LiteRT-LM weight externalization pass."""
+  """Summary of an opt-in LiteRT-LM weight externalization pass.
+
+  Attributes:
+    models_inspected: Number of TFLite model sections that were inspected.
+    models_with_external_weights: Number of models with their own
+      `TFLiteWeights` section in the output.
+    newly_externalized_bytes: Payload bytes moved out of TFLite FlatBuffers into
+      `TFLiteWeights` sections by this pass.
+    redirected_buffers: Number of external buffers that now reference an
+      identical payload in another model's `TFLiteWeights` section (0 unless
+      deduplication was requested).
+    deduplicated_bytes: Bytes removed by that deduplication.
+  """
 
   models_inspected: int
   models_with_external_weights: int
   newly_externalized_bytes: int
+  redirected_buffers: int = 0
+  deduplicated_bytes: int = 0
+
+
+# Separates the weight group name from a model type in external buffer group
+# names that reference another model's TFLiteWeights section, e.g.
+# "tflite_weights:tf_lite_prefill_decode".
+_WEIGHT_GROUP_MODEL_TYPE_SEPARATOR = ":"
 
 
 @enum.unique
@@ -1465,7 +1485,23 @@ class LitertLmFileBuilder:
       *,
       validate_metadata: bool = False,
   ) -> ExternalizationSummary | None:
-    """Builds the litertlm into the given stream."""
+    """Builds the litertlm into the given stream.
+
+    Args:
+      stream: Output stream.
+      validate_metadata: Whether to validate mandatory metadata fields first.
+      externalize_weights: Whether to move eligible TFLite weights into
+        per-model `TFLiteWeights` sections.
+      externalization_work_dir: Optional scratch directory for externalization.
+      num_elements_threshold: Minimum element count for a weight to be
+        externalized.
+      weight_group_name: External buffer group name of per-model weights.
+      dedupe_shared_weights: Whether to also store payloads that are
+        byte-identical across models only once (implies `externalize_weights`).
+
+    Returns:
+      The externalization summary, or None when no externalization ran.
+    """
     if validate_metadata:
       self.validate_metadata()
     self._build_sections(stream, self._sections)
@@ -1710,14 +1746,6 @@ def pack(
     output_path: The path where the packed LiteRT-LM file will be saved.
     jinja_prompt_template_path: Optional path to a Jinja file to overwrite
       jinja_prompt_template.
-
-  Returns:
-    The path to the generated LiteRT-LM file.
-  """
-  packed_path, _ = pack_with_summary(
-      toml_path,
-      output_path,
-      jinja_prompt_template_path,
   )
   return packed_path
 
