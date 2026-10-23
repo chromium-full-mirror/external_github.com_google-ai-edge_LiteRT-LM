@@ -65,6 +65,9 @@ class LogMelSpectrogramProcessor : public AudioPreprocessor {
   static absl::StatusOr<std::unique_ptr<LogMelSpectrogramProcessor>> Create(
       int sample_rate_hz, const LogMelSpectrogramConfig& config,
       Stage<std::vector<float>>* absl_nonnull audio_source);
+  static absl::StatusOr<std::unique_ptr<LogMelSpectrogramProcessor>> Create(
+      int sample_rate_hz, const LogMelSpectrogramConfig& config,
+      AudioSource* absl_nonnull audio_source);
 
   ~LogMelSpectrogramProcessor() override = default;
 

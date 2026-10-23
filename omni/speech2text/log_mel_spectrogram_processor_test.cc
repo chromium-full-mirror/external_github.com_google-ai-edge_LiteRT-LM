@@ -27,6 +27,7 @@
 #include "absl/status/status.h"  // from @com_google_absl
 #include "absl/status/status_matchers.h"  // from @com_google_absl
 #include "omni/base/stage.h"
+#include "omni/speech2text/audio_source.h"
 #include "omni/speech2text/dummy_preprocessor.h"
 #include "support/util/test_utils.h"  // IWYU pragma: keep for ASSERT_OK
 
@@ -36,15 +37,24 @@ namespace {
 using ::testing::FloatNear;
 
 // Dummy AudioSource for testing stage scheduling.
-class DummyAudioSource
-    : public SingleThreadedStageWithDeque<std::vector<float>> {
+class DummyAudioSource : public AudioSource {
  public:
   DummyAudioSource() = default;
-  void PushChunk(std::vector<float> chunk) { PushOutput(std::move(chunk)); }
+  int GetSampleRateHz() const override { return 16000; }
+  int GetNumChannels() const override { return 1; }
+  bool IsLastOutputWarmStart() const override { return last_was_warm_start_; }
+
+  void PushChunk(std::vector<float> chunk, bool is_warm_start = false) {
+    last_was_warm_start_ = is_warm_start;
+    PushOutput(std::move(chunk));
+  }
 
  protected:
   bool NeedScheduleInternal() const override { return false; }
   absl::Status ScheduleInternal() override { return absl::OkStatus(); }
+
+ private:
+  bool last_was_warm_start_ = false;
 };
 
 TEST(LogMelSpectrogramProcessorTest, ProcessEmptyAudioReturnsEmptyVector) {
@@ -835,6 +845,49 @@ TEST(LogMelSpectrogramProcessorTest,
   EXPECT_FLOAT_EQ(result.decode_range->valid_fraction, 210.0f / kWindowFrames);
   EXPECT_NE(result.features[210], 0.0f);
   EXPECT_EQ(result.features[kTotalFrames], 0.0f);
+}
+
+TEST(LogMelSpectrogramProcessorTest,
+     ShortWarmStartChunkDoesNotInflatePeakSpeechRmsForSubsequentFullWindow) {
+  constexpr int kHop = 160;
+  constexpr int kNMels = 80;
+  constexpr int kWindowFrames = 500;
+  constexpr int kWarmStartFrames = 125;
+  // Warm-start chunk has loud speech (`peak = 1.0f`), followed by a full
+  // 500-frame window whose speech is quieter (`0.004f` RMS < `0.05 * warm_rms`
+  // and `< 6e-3f`). Because the warm-start chunk is shorter than
+  // `window_samples_`, it must not update `peak_speech_rms_` and cause the
+  // first full window to be dropped as room noise.
+  std::vector<float> warm_start = MakeTestAudio(kWarmStartFrames * kHop);
+  for (float& s : warm_start) {
+    s *= 2.0f;
+  }
+  std::vector<float> full_window = MakeTestAudio(kWindowFrames * kHop);
+  for (float& s : full_window) {
+    s *= 0.008f;
+  }
+
+  DummyAudioSource source;
+  ASSERT_OK_AND_ASSIGN(auto processor,
+                       LogMelSpectrogramProcessor::Create(
+                           16000,
+                           LogMelSpectrogramProcessor::LogMelSpectrogramConfig{
+                               .n_fft = 512,
+                               .n_mels = kNMels,
+                               .hop_length = kHop,
+                               .n_frames = kWindowFrames},
+                           &source));
+  source.PushChunk(warm_start, /*is_warm_start=*/true);
+  ASSERT_OK(processor->Schedule());
+  ASSERT_OK_AND_ASSIGN(auto warm_result, processor->GetOutput());
+  EXPECT_FALSE(warm_result.features.empty());
+  EXPECT_TRUE(warm_result.is_warm_start);
+
+  source.PushChunk(full_window, /*is_warm_start=*/false);
+  ASSERT_OK(processor->Schedule());
+  ASSERT_OK_AND_ASSIGN(auto full_result, processor->GetOutput());
+  EXPECT_FALSE(full_result.features.empty());
+  EXPECT_FALSE(full_result.is_warm_start);
 }
 
 }  // namespace

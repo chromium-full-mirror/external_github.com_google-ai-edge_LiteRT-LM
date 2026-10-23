@@ -496,6 +496,7 @@ void TimestampTextMerger::ResetInternal() {
   stream_timestamp_offset_ms_ = 0.0;
   prev_chunk_end_ms_ = -1.0;
   last_chunk_end_ms_ = 0;
+  prev_is_warm_start_ = false;
 }
 
 absl::Status TimestampTextMerger::ScheduleInternal() {
@@ -519,11 +520,13 @@ absl::Status TimestampTextMerger::Execute() {
   std::vector<std::string> curr_words;
   std::vector<int> curr_timestamps;
   std::optional<int> max_chunk_timestamp_ms;
+  bool is_warm_start_chunk = false;
   // Whether a word had to be split into several units below.
   bool split_word = false;
   curr_words.reserve(curr_chunk_words.size());
   for (const auto& word : curr_chunk_words) {
     if (word.IsEndOfChunk()) {
+      is_warm_start_chunk = word.is_warm_start;
       if (word.timestamp_ms.has_value()) {
         max_chunk_timestamp_ms = word.timestamp_ms.value();
       }
@@ -556,7 +559,9 @@ absl::Status TimestampTextMerger::Execute() {
   if (split_word) curr_timestamps.clear();
 
   if (curr_words.empty()) {
-    UpdateStreamTimestampOffset(chunk_end_ms);
+    if (!is_warm_start_chunk) {
+      UpdateStreamTimestampOffset(chunk_end_ms);
+    }
     LogAndPushOutput(
         {"", prev_words_.empty() ? "" : JoinWithCjkAwareSpacing(prev_words_)});
     return absl::OkStatus();
@@ -567,11 +572,14 @@ absl::Status TimestampTextMerger::Execute() {
     return absl::OkStatus();
   }
 
-  if (prev_words_.empty()) {
+  if (prev_words_.empty() || prev_is_warm_start_) {
     prev_words_ = curr_words;
     prev_timestamps_ = curr_timestamps;
-    prev_chunk_end_ms_ = stream_timestamp_offset_ms_ + chunk_end_ms;
-    UpdateStreamTimestampOffset(chunk_end_ms);
+    prev_is_warm_start_ = is_warm_start_chunk;
+    if (!is_warm_start_chunk) {
+      prev_chunk_end_ms_ = stream_timestamp_offset_ms_ + chunk_end_ms;
+      UpdateStreamTimestampOffset(chunk_end_ms);
+    }
     LogAndPushOutput({"", JoinWithCjkAwareSpacing(prev_words_)});
     return absl::OkStatus();
   }
@@ -617,10 +625,14 @@ void TimestampTextMerger::MergeByTime(absl::Span<const std::string> curr_words,
   }
 
   const double overlap_len = prev_chunk_end_ms_ - stream_timestamp_offset_ms_;
+  const double tol_scale =
+      last_chunk_end_ms_ > 0
+          ? std::min(overlap_len, 0.5 * static_cast<double>(last_chunk_end_ms_))
+          : overlap_len;
   const Tolerances tol = {
-      .substitution = std::max(1.0, 0.15 * overlap_len),
-      .match_early = std::max(2.0, 0.25 * overlap_len),
-      .match_late = std::max(2.0, 0.5 * overlap_len),
+      .substitution = std::max(1.0, 0.15 * tol_scale),
+      .match_early = std::max(2.0, 0.25 * tol_scale),
+      .match_late = std::max(2.0, 0.5 * tol_scale),
   };
 
   const std::vector<std::string> canon_prev_words =

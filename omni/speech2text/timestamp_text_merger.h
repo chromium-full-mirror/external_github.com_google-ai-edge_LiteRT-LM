@@ -91,6 +91,9 @@ class TimestampTextMerger : public TextMerger {
   // Duration of the most recent non-empty chunk, used to advance
   // `stream_timestamp_offset_ms_` across silent chunks that carry no sentinel.
   int last_chunk_end_ms_ = 0;
+  // Whether `prev_words_` currently holds a progressive warm-start prefix that
+  // should be replaced rather than merged by the next chunk.
+  bool prev_is_warm_start_ = false;
 };
 
 }  // namespace litert::omni::asr

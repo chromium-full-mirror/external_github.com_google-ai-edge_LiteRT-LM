@@ -33,6 +33,9 @@ class DummyPreprocessor : public AudioPreprocessor {
       Stage<std::vector<float>>* absl_nonnull audio_source,
       int pad_to_num_samples = 0);
 
+  explicit DummyPreprocessor(AudioSource* absl_nonnull audio_source,
+                             int pad_to_num_samples = 0);
+
   ~DummyPreprocessor() override = default;
 
  protected:

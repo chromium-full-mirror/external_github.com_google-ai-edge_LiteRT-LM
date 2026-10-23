@@ -35,9 +35,15 @@ DummyPreprocessor::DummyPreprocessor(
     : AudioPreprocessor(audio_source),
       pad_to_num_samples_(pad_to_num_samples) {}
 
+DummyPreprocessor::DummyPreprocessor(AudioSource* absl_nonnull audio_source,
+                                     int pad_to_num_samples)
+    : AudioPreprocessor(audio_source),
+      pad_to_num_samples_(pad_to_num_samples) {}
+
 absl::Status DummyPreprocessor::ScheduleInternal() {
   auto cleanup = absl::MakeCleanup([this]() { SetState(State::kIdle); });
   ABSL_ASSIGN_OR_RETURN(auto raw_speech, audio_source_.GetOutput());
+  const bool is_warm_start = IsLastInputWarmStart();
   // Models that consume raw PCM waveforms directly (such as moonshine-tiny)
   // apply internal normalization inside the encoder subgraph. Feeding digital
   // silence or near-silent background noise causes that internal
@@ -46,7 +52,7 @@ absl::Status DummyPreprocessor::ScheduleInternal() {
   // vector on silent chunks so LiteRtSpeechRecognizer skips encoder/decoder
   // execution.
   if (IsSilentAudio(raw_speech)) {
-    PushOutput(PreprocessedAudio{});
+    PushOutput(PreprocessedAudio{.is_warm_start = is_warm_start});
     return absl::OkStatus();
   }
 
@@ -66,7 +72,8 @@ absl::Status DummyPreprocessor::ScheduleInternal() {
                       (3.5e-3f / 2147483648.0f);
     }
   }
-  PushOutput(PreprocessedAudio{.features = std::move(raw_speech)});
+  PushOutput(PreprocessedAudio{.features = std::move(raw_speech),
+                               .is_warm_start = is_warm_start});
   return absl::OkStatus();
 }
 

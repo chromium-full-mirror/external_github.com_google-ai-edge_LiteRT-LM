@@ -57,13 +57,13 @@ class DummyWordStage
 
   void PushWordsWithEndOfChunkTimestamp(
       const std::vector<std::pair<std::string, int>>& word_ts_pairs,
-      int end_ts_ms) {
+      int end_ts_ms, bool is_warm_start = false) {
     std::vector<Detokenizer::Word> words;
     words.reserve(word_ts_pairs.size() + 1);
     for (const auto& pair : word_ts_pairs) {
       words.push_back({pair.first, pair.second});
     }
-    words.push_back({"", end_ts_ms});
+    words.push_back({"", end_ts_ms, is_warm_start});
     PushOutput(std::move(words));
   }
 
@@ -1122,6 +1122,91 @@ TEST(TimestampTextMergerTest, ChineseCharactersWithTimestampsMergeByTime) {
   EXPECT_EQ(res2.confirmed_text, "你好吗？");
   EXPECT_EQ(res1.confirmed_text + res2.confirmed_text + flushed.confirmed_text,
             "你好吗？北京好玩的。秋天");
+}
+
+TEST(TimestampTextMergerTest, WarmStartPrefixesAreReplacedByFirstFullWindow) {
+  DummyWordStage word_stage;
+  TimestampTextMerger merger(&word_stage, /*overlap_ratio=*/0.75f);
+
+  // Warm-start 1 (0..1250ms, `is_warm_start = true`)
+  word_stage.PushWordsWithEndOfChunkTimestamp({{"hello", 300}, {"wor", 900}},
+                                              /*end_ts_ms=*/5000,
+                                              /*is_warm_start=*/true);
+  ASSERT_OK(merger.Schedule());
+  ASSERT_OK_AND_ASSIGN(auto ws1, GetMergeResult(merger));
+  EXPECT_EQ(ws1.confirmed_text, "");
+  EXPECT_EQ(ws1.unconfirmed_text, "hello wor");
+
+  // Warm-start 2 (0..2500ms, `is_warm_start = true`) corrects "wor" to "world"
+  // without advancing stream_timestamp_offset_ms_.
+  word_stage.PushWordsWithEndOfChunkTimestamp(
+      {{"hello", 300}, {"world", 900}, {"this", 1800}},
+      /*end_ts_ms=*/5000, /*is_warm_start=*/true);
+  ASSERT_OK(merger.Schedule());
+  ASSERT_OK_AND_ASSIGN(auto ws2, GetMergeResult(merger));
+  EXPECT_EQ(ws2.confirmed_text, "");
+  EXPECT_EQ(ws2.unconfirmed_text, "hello world this");
+
+  // Warm-start 3 (empty partial window with `is_warm_start = true`) preserves
+  // `prev_words_` so a transient decoder collapse on a longer prefix does not
+  // blank out the displayed partial transcript before the first full window.
+  word_stage.PushWordsWithEndOfChunkTimestamp({}, /*end_ts_ms=*/5000,
+                                              /*is_warm_start=*/true);
+  ASSERT_OK(merger.Schedule());
+  ASSERT_OK_AND_ASSIGN(auto ws3, GetMergeResult(merger));
+  EXPECT_EQ(ws3.confirmed_text, "");
+  EXPECT_EQ(ws3.unconfirmed_text, "hello world this");
+
+  // First full window (0..5000ms, `is_warm_start = false`) replaces the
+  // warm-start hypothesis and advances stream_timestamp_offset_ms_ to 1250.
+  word_stage.PushWordsWithEndOfChunkTimestamp({{"hello", 300},
+                                               {"world", 900},
+                                               {"this", 1800},
+                                               {"is", 2600},
+                                               {"parakeet", 3500}},
+                                              /*end_ts_ms=*/5000);
+  ASSERT_OK(merger.Schedule());
+  ASSERT_OK_AND_ASSIGN(auto full1, GetMergeResult(merger));
+  EXPECT_EQ(full1.confirmed_text, "");
+  EXPECT_EQ(full1.unconfirmed_text, "hello world this is parakeet");
+
+  // Second full window (1250..6250ms, `is_warm_start = false`) confirms words
+  // before 1250ms ("hello world") and updates the unconfirmed tail.
+  word_stage.PushWordsWithEndOfChunkTimestamp(
+      {{"this", 550}, {"is", 1350}, {"parakeet", 2250}, {"streaming", 4100}},
+      /*end_ts_ms=*/5000);
+  ASSERT_OK(merger.Schedule());
+  ASSERT_OK_AND_ASSIGN(auto full2, GetMergeResult(merger));
+  EXPECT_EQ(full2.confirmed_text, "hello world");
+  EXPECT_EQ(full2.unconfirmed_text, "this is parakeet streaming");
+}
+
+TEST(TimestampTextMergerTest,
+     FirstFullWindowWithTrimmedSilenceConfirmsWordsOnNextWindow) {
+  DummyWordStage word_stage;
+  TimestampTextMerger merger(&word_stage, /*overlap_ratio=*/0.75f);
+
+  // First full window (0..5000ms) had trailing silence trimmed (e.g.
+  // DecodeRange{0.0, 0.6}) so words only appear in the first 1500ms, with
+  // `is_warm_start = false`.
+  word_stage.PushWordsWithEndOfChunkTimestamp({{"call", 300}, {"mom", 800}},
+                                              /*end_ts_ms=*/5000,
+                                              /*is_warm_start=*/false);
+  ASSERT_OK(merger.Schedule());
+  ASSERT_OK_AND_ASSIGN(auto win1, GetMergeResult(merger));
+  EXPECT_EQ(win1.confirmed_text, "");
+  EXPECT_EQ(win1.unconfirmed_text, "call mom");
+
+  // Next full window (1250..6250ms) contains new speech after the pause at
+  // 3500ms relative (4750ms absolute). "call mom" must be confirmed, not
+  // replaced.
+  word_stage.PushWordsWithEndOfChunkTimestamp(
+      {{"right", 3500}, {"now", 4000}}, /*end_ts_ms=*/5000,
+      /*is_warm_start=*/false);
+  ASSERT_OK(merger.Schedule());
+  ASSERT_OK_AND_ASSIGN(auto win2, GetMergeResult(merger));
+  EXPECT_EQ(win2.confirmed_text, "call mom");
+  EXPECT_EQ(win2.unconfirmed_text, "right now");
 }
 
 }  // namespace
