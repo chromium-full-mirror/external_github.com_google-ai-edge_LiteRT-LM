@@ -393,17 +393,21 @@ absl::StatusOr<std::vector<float>> ExtractMelFeatures(
                         processed_audio.GetPreprocessedAudioTensor());
   LITERT_ASSIGN_OR_RETURN(auto tensor_type, tensor_buffer->TensorType());
   LITERT_ASSIGN_OR_RETURN(auto elements, tensor_type.Layout().NumElements());
-  std::vector<float> log_mel_flat(elements);
-  LITERT_RETURN_IF_ERROR(const_cast<litert::TensorBuffer*>(tensor_buffer)
-                             ->Read<float>(absl::MakeSpan(log_mel_flat)));
-
-  const int num_frames = log_mel_flat.size() / config.n_mels;
+  const int num_frames = static_cast<int>(elements) / config.n_mels;
   const int stat_frames = std::min(valid_frames, num_frames);
   std::vector<std::vector<float>> mel_spec(config.n_mels,
                                            std::vector<float>(num_frames));
-  for (int f = 0; f < num_frames; ++f) {
-    for (int m = 0; m < config.n_mels; ++m) {
-      mel_spec[m][f] = log_mel_flat[f * config.n_mels + m];
+  {
+    LITERT_ASSIGN_OR_RETURN(
+        auto lock_and_addr,
+        ::litert::TensorBufferScopedLock::Create<const float>(
+            *const_cast<litert::TensorBuffer*>(tensor_buffer),
+            ::litert::TensorBuffer::LockMode::kRead));
+    const float* log_mel_flat = lock_and_addr.second;
+    for (int f = 0; f < num_frames; ++f) {
+      for (int m = 0; m < config.n_mels; ++m) {
+        mel_spec[m][f] = log_mel_flat[f * config.n_mels + m];
+      }
     }
   }
 
@@ -521,8 +525,12 @@ absl::StatusOr<PreprocessedAudio> LogMelSpectrogramProcessor::Process(
   }
 
   int valid_frames = raw_speech.size() / config_.hop_length;
-  if (IsRoomNoiseFollowUpChunk(raw_speech, valid_frames, config_.hop_length,
-                               peak_speech_rms_)) {
+  const bool is_short_chunk =
+      window_samples_ > 0 && raw_speech.size() < window_samples_;
+  float short_chunk_peak_rms = peak_speech_rms_;
+  if (IsRoomNoiseFollowUpChunk(
+          raw_speech, valid_frames, config_.hop_length,
+          is_short_chunk ? short_chunk_peak_rms : peak_speech_rms_)) {
     preprocessor_->Reset();
     if (centered_preprocessor_) {
       centered_preprocessor_->Reset();
@@ -531,8 +539,6 @@ absl::StatusOr<PreprocessedAudio> LogMelSpectrogramProcessor::Process(
     return PreprocessedAudio{};
   }
 
-  const bool is_short_chunk =
-      window_samples_ > 0 && raw_speech.size() < window_samples_;
   if (ShiftsShortChunkBack() && !is_short_chunk) {
     // Keep the most recent full non-silent window so a subsequent short final
     // chunk can be shifted back over it.

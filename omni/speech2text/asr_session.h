@@ -61,6 +61,10 @@ class AsrSessionFactory : public OmniSessionFactory {
   }
 
  protected:
+  // Whether `AudioInputSource` should emit progressive partial-window prefixes
+  // before the first full `input_milliseconds` window is accumulated.
+  virtual bool ShouldEnableWarmStart() const { return false; }
+
   // Subclasses override this to call `CreateMultiStagedSession` below with
   // `audio_source` built from `input_source` by this class, and `encoder` and
   // `decoder` instantiated by subclasses.
@@ -83,7 +87,7 @@ class AsrSessionFactory : public OmniSessionFactory {
   static std::unique_ptr<AudioSource> CreateAudioInputSource(
       std::unique_ptr<OmniSession::InputSource> absl_nonnull input_source,
       int sample_rate_hz, int num_channels, int samples_per_interval,
-      int overlap_samples);
+      int overlap_samples, bool enable_warm_start = false);
 
   lm::proto::Speech2TextSessionConfig session_config_;
   lm::proto::Speech2TextMetadata metadata_;

@@ -92,6 +92,26 @@ absl::Status LiteRtSpeechRecognizer::ScheduleInternal() {
     ABSL_ASSIGN_OR_RETURN(decoded_tokens,
                           MaybeRetryWithCenteredFeatures(
                               preprocessed_audio, std::move(decoded_tokens)));
+    const auto& range = *preprocessed_audio.decode_range;
+    if (range.start_fraction == 0.0f && range.valid_fraction > 0.0f &&
+        range.valid_fraction < 1.0f) {
+      if (!decoded_tokens.empty() &&
+          decoded_tokens.back().token_id == DecodedToken::kEndOfChunkTokenId &&
+          decoded_tokens.back().timestamp_ms.has_value() &&
+          *decoded_tokens.back().timestamp_ms > 0) {
+        // Negate the end-of-chunk marker timestamp on unshifted partial windows
+        // so `TimestampTextMerger` can distinguish progressive warm-start
+        // prefixes (whose window origin stays at 0) from full sliding windows
+        // while still recovering the full window frame count.
+        decoded_tokens.back().timestamp_ms =
+            -*decoded_tokens.back().timestamp_ms;
+      } else if (decoded_tokens.empty() ||
+                 decoded_tokens.back().token_id !=
+                     DecodedToken::kEndOfChunkTokenId) {
+        decoded_tokens.push_back(DecodedToken{
+            .token_id = DecodedToken::kEndOfChunkTokenId, .timestamp_ms = -1});
+      }
+    }
   }
   PushOutput(std::move(decoded_tokens));
   return absl::OkStatus();

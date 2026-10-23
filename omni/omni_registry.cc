@@ -192,15 +192,15 @@ absl::Status ConfigureLiteRtOptions(absl::string_view model_name,
   ABSL_ASSIGN_OR_RETURN(
       const ModelCacheConfig cache,
       ResolveModelCache(model_name, settings.model_path, settings.cache_dir));
-  if (settings.num_threads > 0 || !cache.key.empty()) {
-    LITERT_ASSIGN_OR_RETURN(auto& cpu_options,
-                            options.GetOptions<::litert::CpuOptions>());
-    if (settings.num_threads > 0) {
-      cpu_options.SetNumThreads(settings.num_threads);
-    }
-    ABSL_RETURN_IF_ERROR(
-        ConfigureCpuModelCache(model_name, cache, cpu_options));
-  }
+  LITERT_ASSIGN_OR_RETURN(auto& cpu_options,
+                          options.GetOptions<::litert::CpuOptions>());
+  const int num_threads = settings.num_threads > 0 ? settings.num_threads : 4;
+  LITERT_RETURN_IF_ERROR(cpu_options.SetNumThreads(num_threads));
+  LITERT_ASSIGN_OR_RETURN(uint32_t xnn_flags, cpu_options.GetXNNPackFlags());
+  // Enable TFLITE_XNNPACK_DELEGATE_FLAG_DYNAMIC_FULLY_CONNECTED (0x00000008)
+  // and TFLITE_XNNPACK_DELEGATE_FLAG_ENABLE_LATEST_OPERATORS (0x00000040).
+  LITERT_RETURN_IF_ERROR(cpu_options.SetXNNPackFlags(xnn_flags | 0x00000048u));
+  ABSL_RETURN_IF_ERROR(ConfigureCpuModelCache(model_name, cache, cpu_options));
   if (settings.backend == OmniEngine::Settings::Backend::kGpu) {
     accelerators |= static_cast<uint32_t>(::litert::HwAccelerators::kGpu);
     LITERT_ASSIGN_OR_RETURN(auto& gpu_options,

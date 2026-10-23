@@ -117,6 +117,8 @@ TEST(ModelUtilsTest, CreateCompiledModelConfiguresModelCaches) {
                                       "kokoro_vocoder");
   EXPECT_FALSE(std::filesystem::exists(
       root / "kokoro_vocoder_1_2_mldrift_program_cache.bin"));
+  (void)CreateLmRunner(*env, cpu_opts, "bundle.litertlm");
+  (void)CreateLmEngineRunner(*env, cpu_opts, "bundle.litertlm");
   std::filesystem::remove_all(root);
 }
 

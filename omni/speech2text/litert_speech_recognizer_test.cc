@@ -503,5 +503,66 @@ TEST(LiteRtSpeechRecognizerTest,
   EXPECT_EQ(chunk3_tokens[0].token_id, 13);
 }
 
+TEST(LiteRtSpeechRecognizerTest,
+     MarksUnshiftedWarmStartChunksWithNegativeEndOfChunkTimestamp) {
+  auto mock_runner = std::make_unique<MockLiteRtRunner>();
+  EXPECT_CALL(*mock_runner, CreateInputBuffers(_))
+      .WillOnce([](absl::string_view) {
+        std::vector<::litert::TensorBuffer> buffers;
+        buffers.push_back(CreateTestTensorBuffer(16, sizeof(float)));
+        return buffers;
+      });
+  EXPECT_CALL(*mock_runner, CreateOutputBuffers(_))
+      .WillOnce([](absl::string_view) {
+        std::vector<::litert::TensorBuffer> buffers;
+        buffers.push_back(CreateTestTensorBuffer(16, sizeof(float)));
+        return buffers;
+      });
+  EXPECT_CALL(*mock_runner, Run("encode", _, _))
+      .Times(2)
+      .WillRepeatedly(Return(absl::OkStatus()));
+
+  DummyAudioPreprocessor preprocessor;
+  // Unshifted partial warm-start chunk (`start_fraction == 0.0f &&
+  // valid_fraction < 1.0f`) with a timestamped decoder (`kEndOfChunkTokenId`
+  // has positive `timestamp_ms = 63`).
+  preprocessor.PushFeatures(
+      {1.0f, 2.0f, 3.0f}, PreprocessedAudio::DecodeRange{
+                              .start_fraction = 0.0f, .valid_fraction = 0.25f});
+  // Unshifted partial warm-start chunk with a non-timestamped decoder (no
+  // `kEndOfChunkTokenId` returned by `Decode`).
+  preprocessor.PushFeatures(
+      {1.0f, 2.0f, 3.0f}, PreprocessedAudio::DecodeRange{
+                              .start_fraction = 0.0f, .valid_fraction = 0.5f});
+
+  auto decoder = std::make_unique<SequenceDecoder>(
+      std::vector<std::vector<SpeechRecognizer::DecodedToken>>{
+          {{.token_id = 10, .timestamp_ms = 3},
+           {.token_id = SpeechRecognizer::DecodedToken::kEndOfChunkTokenId,
+            .timestamp_ms = 63}},
+          {{.token_id = 20, .timestamp_ms = std::nullopt}},
+      });
+
+  ASSERT_OK_AND_ASSIGN(auto recognizer, LiteRtSpeechRecognizer::Create(
+                                            std::move(mock_runner),
+                                            &preprocessor, std::move(decoder)));
+
+  ASSERT_OK(recognizer->Schedule());
+  ASSERT_OK_AND_ASSIGN(auto warm1_tokens, recognizer->GetOutput());
+  ASSERT_EQ(warm1_tokens.size(), 2);
+  EXPECT_EQ(warm1_tokens[0].token_id, 10);
+  EXPECT_EQ(warm1_tokens[1].token_id,
+            SpeechRecognizer::DecodedToken::kEndOfChunkTokenId);
+  EXPECT_EQ(warm1_tokens[1].timestamp_ms, -63);
+
+  ASSERT_OK(recognizer->Schedule());
+  ASSERT_OK_AND_ASSIGN(auto warm2_tokens, recognizer->GetOutput());
+  ASSERT_EQ(warm2_tokens.size(), 2);
+  EXPECT_EQ(warm2_tokens[0].token_id, 20);
+  EXPECT_EQ(warm2_tokens[1].token_id,
+            SpeechRecognizer::DecodedToken::kEndOfChunkTokenId);
+  EXPECT_EQ(warm2_tokens[1].timestamp_ms, -1);
+}
+
 }  // namespace
 }  // namespace litert::omni::asr

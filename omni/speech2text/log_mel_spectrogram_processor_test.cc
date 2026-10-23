@@ -837,5 +837,46 @@ TEST(LogMelSpectrogramProcessorTest,
   EXPECT_EQ(result.features[kTotalFrames], 0.0f);
 }
 
+TEST(LogMelSpectrogramProcessorTest,
+     ShortWarmStartChunkDoesNotInflatePeakSpeechRmsForSubsequentFullWindow) {
+  constexpr int kHop = 160;
+  constexpr int kNMels = 80;
+  constexpr int kWindowFrames = 500;
+  constexpr int kWarmStartFrames = 125;
+  // Warm-start chunk has loud speech (`peak = 1.0f`), followed by a full
+  // 500-frame window whose speech is quieter (`0.004f` RMS < `0.05 * warm_rms`
+  // and `< 6e-3f`). Because the warm-start chunk is shorter than
+  // `window_samples_`, it must not update `peak_speech_rms_` and cause the
+  // first full window to be dropped as room noise.
+  std::vector<float> warm_start = MakeTestAudio(kWarmStartFrames * kHop);
+  for (float& s : warm_start) {
+    s *= 2.0f;
+  }
+  std::vector<float> full_window = MakeTestAudio(kWindowFrames * kHop);
+  for (float& s : full_window) {
+    s *= 0.008f;
+  }
+
+  DummyAudioSource source;
+  ASSERT_OK_AND_ASSIGN(auto processor,
+                       LogMelSpectrogramProcessor::Create(
+                           16000,
+                           LogMelSpectrogramProcessor::LogMelSpectrogramConfig{
+                               .n_fft = 512,
+                               .n_mels = kNMels,
+                               .hop_length = kHop,
+                               .n_frames = kWindowFrames},
+                           &source));
+  source.PushChunk(warm_start);
+  ASSERT_OK(processor->Schedule());
+  ASSERT_OK_AND_ASSIGN(auto warm_result, processor->GetOutput());
+  EXPECT_FALSE(warm_result.features.empty());
+
+  source.PushChunk(full_window);
+  ASSERT_OK(processor->Schedule());
+  ASSERT_OK_AND_ASSIGN(auto full_result, processor->GetOutput());
+  EXPECT_FALSE(full_result.features.empty());
+}
+
 }  // namespace
 }  // namespace litert::omni::asr
