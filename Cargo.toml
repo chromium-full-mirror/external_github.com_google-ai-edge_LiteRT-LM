@@ -12,7 +12,7 @@ publish = false
 [dependencies]
 antlr4rust = "0.5"
 chrono = "0.4"
-cxx = "=1.0.149"
+cxx = "=1.0.205"
 googletest = "0.14"
 indexmap = "2.12"
 llguidance = { version = "=1.9.1", default-features = false, features = ["lark", "rayon", "ahash"] }
