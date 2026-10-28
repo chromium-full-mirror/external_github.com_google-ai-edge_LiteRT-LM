@@ -59,7 +59,7 @@ propcache==0.4.1
 pyarrow==23.0.1
 pytablewriter==1.2.1
 python-dateutil==2.9.0.post0
-pytz==2026.1.post1
+pytz==2026.5
 regex==2026.4.4
 requests==2.33.1
 rouge-score==0.1.2
