@@ -43,6 +43,7 @@ import contextlib
 import dataclasses
 import datetime
 import enum
+import hashlib
 import io
 import logging
 import os
@@ -1706,6 +1707,30 @@ class LitertLmFileBuilder:
     # Add UUID if not already present, but always generate a new timestamp.
     self._system_metadata = populate_system_metadata(self._system_metadata)
 
+    # Pre-populate placeholder sha256 for system_metadata (model content hash)
+    # and each section (section content hash) with 64-char strings so the
+    # packed FlatBuffer size is fixed upfront.
+    self._system_metadata = [
+        m for m in self._system_metadata if m.key != "model_content_sha256"
+    ]
+    self._system_metadata.append(
+        Metadata(
+            key="model_content_sha256",
+            value="0" * 64,
+            dtype=DType.STRING,
+        )
+    )
+
+    for s in sections:
+      s.metadata = [m for m in s.metadata if m.key != "sha256"]
+      s.metadata.append(
+          Metadata(
+              key="sha256",
+              value="0" * 64,
+              dtype=DType.STRING,
+          )
+      )
+
     # Populate a SystemMetadataT object from `self._system_metadata`.
     system_metadata = schema.SystemMetadataT(
         entries=[m.to_key_value_pair() for m in self._system_metadata]
@@ -1736,13 +1761,42 @@ class LitertLmFileBuilder:
     offset = _round_up_to_block_size(
         litertlm_core.HEADER_BEGIN_BYTE_OFFSET + packed_metadata_size
     )
+    model_hasher = hashlib.sha256()
     for section, section_fb in zip(sections, section_metadata.objects):  # pyrefly: ignore[bad-argument-type]
       stream.seek(offset)
       section_fb.beginOffset = offset
       section.data_writer(stream)
       offset = stream.tell()
       section_fb.endOffset = offset
+
+      # Compute SHA-256 for the written section data and update model_hasher.
+      section_sha256 = _compute_sha256_for_range(
+          stream, section_fb.beginOffset, section_fb.endOffset, model_hasher
+      )
+      # Update the section's sha256 item in section_fb and section.metadata.
+      if section_fb.items is not None:
+        for item in section_fb.items:
+          if item.key == "sha256":
+            item.value = schema.StringValueT(section_sha256)
+            break
+      for m in section.metadata:
+        if m.key == "sha256":
+          m.value = section_sha256
+          break
+
       offset = _round_up_to_block_size(offset)
+
+    # Update model_content_sha256 in system_metadata.
+    model_sha256 = model_hasher.hexdigest()
+    if system_metadata.entries is not None:
+      for entry in system_metadata.entries:
+        if entry.key == "model_content_sha256":
+          entry.value = schema.StringValueT(model_sha256)
+          break
+    for m in self._system_metadata:
+      if m.key == "model_content_sha256":
+        m.value = model_sha256
+        break
 
     # Go back and write the header and updated metadata at the start of the
     # output file.
@@ -1761,6 +1815,62 @@ class LitertLmFileBuilder:
         ).to_bytes(8, "little")
     )
     stream.write(metadata_builder.Output())
+
+
+def _compute_sha256_for_range(
+    stream: BinaryIO,
+    start: int,
+    end: int,
+    model_hasher: Any = None,
+    buffer_size: int = 1024 * 1024,
+) -> str:
+  """Computes the SHA-256 hash for a byte range in stream and updates model_hasher."""
+  stream.flush()
+  hasher = hashlib.sha256()
+
+  # If stream is a file on disk opened in write-only mode, read via a separate read handle.
+  if (
+      hasattr(stream, "name")
+      and isinstance(stream.name, str)
+      and os.path.exists(stream.name)
+  ):
+    with litertlm_core.open_file(stream.name, "rb") as read_stream:
+      read_stream.seek(start)
+      remaining = end - start
+      while remaining > 0:
+        chunk_size = min(buffer_size, remaining)
+        chunk = read_stream.read(chunk_size)
+        if not chunk:
+          break
+        hasher.update(chunk)
+        if model_hasher is not None:
+          model_hasher.update(chunk)
+        remaining -= len(chunk)
+    return hasher.hexdigest()
+
+  # If stream is an in-memory buffer (e.g. io.BytesIO).
+  if hasattr(stream, "getvalue"):
+    data = stream.getvalue()[start:end]
+    hasher.update(data)
+    if model_hasher is not None:
+      model_hasher.update(data)
+    return hasher.hexdigest()
+
+  # Fallback for streams supporting read.
+  current_pos = stream.tell()
+  stream.seek(start)
+  remaining = end - start
+  while remaining > 0:
+    chunk_size = min(buffer_size, remaining)
+    chunk = stream.read(chunk_size)
+    if not chunk:
+      break
+    hasher.update(chunk)
+    if model_hasher is not None:
+      model_hasher.update(chunk)
+    remaining -= len(chunk)
+  stream.seek(current_pos)
+  return hasher.hexdigest()
 
 
 def _round_up_to_block_size(offset: int) -> int:
@@ -1790,7 +1900,7 @@ def _copy_file_to_stream(f_src: Any, f_dst: BinaryIO, buffer_size=1024 * 1024):
       ):
         offset += bytes_sent
         num_bytes -= bytes_sent
-    except OSError:
+    except (OSError, AttributeError, io.UnsupportedOperation):
       pass
     else:
       if num_bytes == 0:
