@@ -20,6 +20,7 @@
 #include <fstream>
 #include <iterator>
 #include <string>
+#include <thread>  // NOLINT(build/c++11)
 #include <utility>
 #include <vector>
 
@@ -167,6 +168,34 @@ TEST(HuggingFaceTokenizerTest, GetTokens) {
   EXPECT_EQ(tokens[17], "!");
   EXPECT_EQ(tokens[47], "?");
   EXPECT_EQ(tokens[72], "X");
+}
+
+TEST(HuggingFaceTokenizerTest, ConcurrentEncodeAndDecodeIsThreadSafe) {
+  ASSERT_OK_AND_ASSIGN(auto tokenizer, HuggingFaceTokenizer::CreateFromFile(
+                                           GetHuggingFaceModelPath()));
+
+  constexpr int kNumThreads = 4;
+  constexpr int kIterationsPerThread = 50;
+  std::vector<std::thread> threads;
+  threads.reserve(kNumThreads);
+  for (int t = 0; t < kNumThreads; ++t) {
+    threads.emplace_back([&tokenizer]() {
+      for (int i = 0; i < kIterationsPerThread; ++i) {
+        ASSERT_OK_AND_ASSIGN(std::vector<int> ids,
+                             tokenizer->TextToTokenIds("How's it going?"));
+        EXPECT_THAT(ids, testing::ElementsAre(2020, 506, 357, 2045, 47));
+        ASSERT_OK_AND_ASSIGN(int token_id, tokenizer->TokenToId("X"));
+        EXPECT_EQ(token_id, 72);
+        ASSERT_OK_AND_ASSIGN(std::string text,
+                             tokenizer->TokenIdsToText(ids, /*skip=*/true));
+        EXPECT_EQ(text, "How's it going?");
+        EXPECT_EQ(tokenizer->GetVocabSize(), 49152);
+      }
+    });
+  }
+  for (auto& thread : threads) {
+    thread.join();
+  }
 }
 
 }  // namespace
