@@ -24,6 +24,7 @@
 #include <utility>
 #include <vector>
 
+#include "absl/base/thread_annotations.h"  // from @com_google_absl
 #include "absl/container/flat_hash_map.h"  // from @com_google_absl
 #include "absl/status/status.h"  // from @com_google_absl
 #include "absl/status/statusor.h"  // from @com_google_absl
@@ -144,6 +145,60 @@ struct DrafterAuxContext {
           drafter_input_buffers);
 };
 
+class LlmLiteRtNpuCompiledModelExecutor;
+
+// A context saved by `LlmLiteRtNpuCompiledModelExecutor::SaveContext()`: copies
+// of the KV cache buffers whose entries later steps overwrite before they are
+// rolled back (the ring buffer KV cache of the sliding window layers), and the
+// processed tokens. Only the executor that saved it can restore it, with
+// `RestoreContext()`, after `SetCurrentStep()` rolled back to its step.
+class NpuSavedContext : public ProcessedContext {
+ public:
+  ~NpuSavedContext() override = default;
+
+  std::optional<uint32_t> lora_id() const override { return std::nullopt; }
+  void set_lora_id(std::optional<uint32_t> lora_id) override {}
+  ProcessedTokens& processed_tokens() override { return processed_tokens_; }
+  const ProcessedTokens& processed_tokens() const { return processed_tokens_; }
+
+  // The executor step when the context was saved.
+  int step() const { return step_; }
+  // The executor's active context group when the context was saved.
+  int context_group_index() const { return context_group_index_; }
+  // The saved buffers, by KV cache input name.
+  const absl::flat_hash_map<std::string, ::litert::TensorBuffer>& buffers()
+      const {
+    return buffers_;
+  }
+
+ private:
+  friend class LlmLiteRtNpuCompiledModelExecutor;
+
+  NpuSavedContext(
+      const LlmLiteRtNpuCompiledModelExecutor* owner,
+      std::shared_ptr<void> registration,
+      absl::flat_hash_map<std::string, ::litert::TensorBuffer> buffers,
+      ProcessedTokens processed_tokens, int step, int context_group_index)
+      : owner_(owner),
+        registration_(std::move(registration)),
+        buffers_(std::move(buffers)),
+        processed_tokens_(std::move(processed_tokens)),
+        step_(step),
+        context_group_index_(context_group_index) {}
+
+  // The executor that saved the context. Only compared, never dereferenced,
+  // since the executor may be destroyed before the context.
+  const LlmLiteRtNpuCompiledModelExecutor* owner_;
+  // Keeps the context registered in the executor that saved it until the
+  // context is destroyed (see
+  // `LlmLiteRtNpuCompiledModelExecutor::RegisterSavedContext`).
+  std::shared_ptr<void> registration_;
+  absl::flat_hash_map<std::string, ::litert::TensorBuffer> buffers_;
+  ProcessedTokens processed_tokens_;
+  int step_;
+  int context_group_index_;
+};
+
 // Component intended to be used with an NPU variant of Gemma3.
 class LlmLiteRtNpuCompiledModelExecutor : public LlmExecutor {
  public:
@@ -225,6 +280,23 @@ class LlmLiteRtNpuCompiledModelExecutor : public LlmExecutor {
 
   absl::Status RestoreContext(
       std::unique_ptr<LlmContext> context_data) override;
+
+  // Saves the KV cache buffers whose entries later steps overwrite before they
+  // are rolled back (the ring buffer KV cache of the sliding window layers),
+  // so that rolling back more than one token after the ring buffer has wrapped
+  // around can be undone with `RestoreContext(ProcessedContext)`. Copies no
+  // buffers for models without a ring buffer KV cache. Used by Conversation
+  // with rewinding disabled (`ConversationConfig::enable_rewinding()`), the
+  // default for the NPU backend.
+  absl::StatusOr<std::unique_ptr<ProcessedContext>> SaveContext()
+      const override;
+
+  // Restores a context saved by `SaveContext()` of this executor (an
+  // `NpuSavedContext`), after `SetCurrentStep` rolled back to its step.
+  // Validates the context before changing any state, so the executor is
+  // unchanged if it fails.
+  absl::Status RestoreContext(
+      std::unique_ptr<ProcessedContext> processed_context) override;
 
  private:
   enum class SpeculativeDecodingType {
@@ -639,6 +711,45 @@ class LlmLiteRtNpuCompiledModelExecutor : public LlmExecutor {
   // Tracks whether a decode step was run so we know how to update the
   // constraint state.
   bool ran_decode_ = false;
+
+  // Set when `SetCurrentStep` rolled back more than one token after the ring
+  // buffer KV cache wrapped around, until `RestoreContext(ProcessedContext)`
+  // restored the ring buffer (or `RestoreContext(LlmContext)` the whole KV
+  // cache). Prefill, decode and `CloneContext` fail while it is set, since the
+  // ring buffer holds the entries of the rolled back steps. It is not part of
+  // `LlmContext`, which is why `CloneContext` fails instead.
+  bool ring_buffer_restore_required_ = false;
+
+  // The contexts saved with `SaveContext()` that are still alive: the number of
+  // contexts per step and fingerprint of the processed tokens before that step
+  // (see `ProcessedTokensFingerprint`). A saved context unregisters itself when
+  // it is destroyed (e.g. after `RestoreContext` restored it, or when its
+  // session drops it). `SetCurrentStep` only rolls back more than one token
+  // after the ring buffer KV cache wrapped around to the step of a saved
+  // context with the same processed tokens, which `RestoreContext` then has to
+  // restore. Sessions share the executor, so contexts saved by other sessions
+  // are registered too, but only ones with the same tokens, and so the same
+  // ring buffer contents, are accepted.
+  struct SavedContextRegistry {
+    absl::Mutex mutex;
+    absl::flat_hash_map<std::pair<int, size_t>, int> counts
+        ABSL_GUARDED_BY(mutex);
+  };
+  std::shared_ptr<SavedContextRegistry> saved_contexts_ =
+      std::make_shared<SavedContextRegistry>();
+
+  // Registers a saved context at `step` with the processed tokens fingerprint
+  // `fingerprint`. Returns a handle that unregisters it when destroyed (also
+  // after the executor was destroyed).
+  std::shared_ptr<void> RegisterSavedContext(int step,
+                                             size_t fingerprint) const;
+
+  // Returns true if a context saved at `step` with the processed tokens
+  // fingerprint `fingerprint` is alive.
+  bool HasSavedContext(int step, size_t fingerprint) const;
+
+  // Returns an error if `ring_buffer_restore_required_` is set.
+  absl::Status CheckRingBufferRestored() const;
   int64_t kv_cache_init_value_ = 0;
 
   // The text decoder model (owned by ModelResources, which outlives the

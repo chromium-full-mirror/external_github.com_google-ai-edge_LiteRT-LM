@@ -161,6 +161,7 @@ cc_test(
         "//runtime/components:model_resources",
         "//runtime/executor:executor_settings_base",
         "//runtime/executor:llm_executor_io_types",
+        "//runtime/executor:llm_executor_processed_tokens",
         "//runtime/executor:llm_executor_settings",
         "//runtime/executor:llm_litert_npu_compiled_model_executor",
         "//runtime/proto:llm_metadata_cc_proto",
