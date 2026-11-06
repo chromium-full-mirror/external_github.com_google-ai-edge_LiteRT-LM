@@ -31,6 +31,7 @@
 #include <gtest/gtest.h>
 #include "absl/log/absl_check.h"  // from @com_google_absl
 #include "absl/log/absl_log.h"  // from @com_google_absl
+#include "absl/log/log_sink_registry.h"  // from @com_google_absl
 #include "absl/status/status.h"  // from @com_google_absl
 #include "absl/strings/escaping.h"  // from @com_google_absl
 #include "absl/strings/str_cat.h"  // from @com_google_absl
@@ -42,6 +43,7 @@
 #include "runtime/executor/llm_executor_settings.h"
 #include "runtime/executor/mtp_gating_policy.h"
 #include "runtime/executor/speculative_decoding_mode.h"
+#include "runtime/proto/engine.pb.h"
 #include "runtime/proto/sampler_params.pb.h"
 #include "runtime/util/test_utils.h"  // IWYU pragma: keep
 
@@ -1208,6 +1210,226 @@ TEST(PrintMessageTest, StreamingTransitionChannelToContent) {
   EXPECT_EQ(coopt.GetOutput(),
             ColorBlue("[/thought]") + "\n" + ColorYellow("Final answer."));
   EXPECT_EQ(active_channel, "");
+}
+
+TEST(LiteRtLmLibTest, CreateEngineSettingsAppendChunksValidation) {
+  const std::filesystem::path model_path =
+      std::filesystem::path(testing::SrcDir()) /
+      "litert_lm/runtime/testdata/test_lm.litertlm";
+
+  LiteRtLmSettings negative_chunks;
+  negative_chunks.model_path = model_path.string();
+  negative_chunks.benchmark_append_chunks = -1;
+  EXPECT_THAT(CreateEngineSettings(negative_chunks),
+              StatusIs(absl::StatusCode::kInvalidArgument));
+
+  LiteRtLmSettings missing_benchmark;
+  missing_benchmark.model_path = model_path.string();
+  missing_benchmark.benchmark = false;
+  missing_benchmark.benchmark_append_chunks = 4;
+  EXPECT_THAT(CreateEngineSettings(missing_benchmark),
+              StatusIs(absl::StatusCode::kInvalidArgument));
+
+  LiteRtLmSettings with_session;
+  with_session.model_path = model_path.string();
+  with_session.benchmark = true;
+  with_session.benchmark_append_chunks = 4;
+  with_session.use_session = true;
+  EXPECT_THAT(CreateEngineSettings(with_session),
+              StatusIs(absl::StatusCode::kInvalidArgument));
+
+  LiteRtLmSettings with_interactive_multi_turns;
+  with_interactive_multi_turns.model_path = model_path.string();
+  with_interactive_multi_turns.benchmark = true;
+  with_interactive_multi_turns.benchmark_append_chunks = 4;
+  with_interactive_multi_turns.multi_turns = true;
+  EXPECT_THAT(CreateEngineSettings(with_interactive_multi_turns),
+              StatusIs(absl::StatusCode::kInvalidArgument));
+
+  LiteRtLmSettings with_score_target;
+  with_score_target.model_path = model_path.string();
+  with_score_target.benchmark = true;
+  with_score_target.benchmark_append_chunks = 4;
+  with_score_target.score_target_text = "target";
+  EXPECT_THAT(CreateEngineSettings(with_score_target),
+              StatusIs(absl::StatusCode::kInvalidArgument));
+
+  LiteRtLmSettings valid;
+  valid.model_path = model_path.string();
+  valid.backend = "cpu";
+  valid.disable_cache = true;
+  valid.benchmark = true;
+  valid.benchmark_prefill_tokens = 256;
+  valid.benchmark_decode_tokens = 256;
+  valid.benchmark_append_chunks = 4;
+  ASSERT_OK_AND_ASSIGN(const EngineSettings engine_settings,
+                       CreateEngineSettings(valid));
+  ASSERT_TRUE(engine_settings.GetBenchmarkParams().has_value());
+  EXPECT_EQ(engine_settings.GetBenchmarkParams()->num_prefill_tokens(), 256);
+  EXPECT_EQ(engine_settings.GetBenchmarkParams()->num_decode_tokens(), 256);
+}
+
+class CooptStdin {
+ public:
+  explicit CooptStdin(const std::string& input)
+      : buffer_(input), old_buf_(std::cin.rdbuf(buffer_.rdbuf())) {}
+  ~CooptStdin() { std::cin.rdbuf(old_buf_); }
+
+ private:
+  std::istringstream buffer_;
+  std::streambuf* old_buf_;
+};
+
+TEST(LiteRtLmLibTest, RunLiteRtLmInteractiveMultiTurnAsync) {
+  const std::filesystem::path model_path =
+      std::filesystem::path(testing::SrcDir()) /
+      "litert_lm/runtime/testdata/test_lm.litertlm";
+
+  LiteRtLmSettings settings;
+  settings.model_path = model_path.string();
+  settings.backend = "cpu";
+  settings.disable_cache = true;
+  settings.multi_turns = true;
+  settings.async = true;
+  settings.max_num_tokens = 32;
+  settings.max_output_tokens = 2;
+  {
+    CooptStdin stdin_input("Hello\n\n");
+    CooptStdout stdout_capture;
+    EXPECT_OK(RunLiteRtLm(settings));
+  }
+
+  settings.max_num_tokens = 10;
+  {
+    CooptStdin stdin_overflow(
+        "Hello world Hello world Hello world Hello world Hello world\n\n");
+    CooptStdout stdout_capture;
+    EXPECT_THAT(
+        RunLiteRtLm(settings),
+        StatusIs(absl::StatusCode::kInvalidArgument,
+                 testing::HasSubstr("Exceeding the maximum number of tokens")));
+  }
+}
+
+BenchmarkInfo CreateMultiPrefillBenchmarkInfo() {
+  proto::BenchmarkParams params;
+  params.set_num_prefill_tokens(256);
+  params.set_num_decode_tokens(256);
+  BenchmarkInfo info(params);
+  ABSL_CHECK_OK(info.InitPhaseRecord(BenchmarkInfo::InitPhase::kExecutor,
+                                     absl::Milliseconds(50)));
+  // Four 256-token appended chunks followed by one 5-token closing prefill,
+  // then a single 256-token decode pass.
+  for (int chunk = 0; chunk < 4; ++chunk) {
+    ABSL_CHECK_OK(info.TimePrefillTurnStart());
+    ABSL_CHECK_OK(info.TimePrefillTurnEnd(256));
+  }
+  ABSL_CHECK_OK(info.TimePrefillTurnStart());
+  ABSL_CHECK_OK(info.TimePrefillTurnEnd(5));
+  ABSL_CHECK_OK(info.TimeDecodeTurnStart());
+  ABSL_CHECK_OK(info.TimeDecodeTurnEnd(256));
+  return info;
+}
+
+TEST(LiteRtLmLibTest, LogBenchmarkAndAggregatedMetricsWithoutLogSinkFile) {
+  const std::filesystem::path capture_path =
+      std::filesystem::path(testing::TempDir()) / "human_readable_metrics.log";
+  std::filesystem::remove(capture_path);
+
+  LiteRtLmSettings settings;
+  settings.backend = "gpu";
+  settings.benchmark = true;
+  settings.benchmark_prefill_tokens = 256;
+  settings.benchmark_decode_tokens = 256;
+  settings.benchmark_append_chunks = 4;
+
+  LitertLmMetrics m1;
+  m1.benchmark_info = CreateMultiPrefillBenchmarkInfo();
+  m1.peak_mem_mb = 1450.0f;
+  m1.peak_private_mb = 1200.0f;
+  LitertLmMetrics m2 = m1;
+  m2.peak_mem_mb = 1550.0f;
+  m2.peak_private_mb = 1300.0f;
+
+  {
+    FileLogSink sink(capture_path.string());
+    absl::AddLogSink(&sink);
+    LogBenchmarkInfo(*m1.benchmark_info, settings);
+    LogAggregatedMetrics(ComputeMedianMetrics({m1, m2}), settings);
+    absl::RemoveLogSink(&sink);
+  }
+
+  std::ifstream log_file(capture_path);
+  ASSERT_TRUE(log_file.is_open());
+  const std::string log_contents((std::istreambuf_iterator<char>(log_file)),
+                                 std::istreambuf_iterator<char>());
+  EXPECT_THAT(log_contents,
+              testing::HasSubstr("Prefill Turns (Total 5 turns):"));
+  EXPECT_THAT(log_contents,
+              testing::HasSubstr("Decode Turns (Total 1 turns):"));
+  EXPECT_THAT(
+      log_contents,
+      testing::HasSubstr("Aggregated BenchmarkInfo (median of 2 iterations):"));
+  EXPECT_THAT(log_contents, testing::HasSubstr("Prefill Turn 5:"));
+  EXPECT_THAT(log_contents, testing::HasSubstr("Decode Turn 1:"));
+  EXPECT_THAT(log_contents,
+              testing::Not(testing::HasSubstr("Decode Turn 2:")));
+}
+
+TEST(LiteRtLmLibTest,
+     LogMultiPrefillBenchmarkAndAggregatedMetricsToLogSink) {
+  const std::filesystem::path log_sink_path =
+      std::filesystem::path(testing::TempDir()) / "multi_prefill_benchmark.log";
+  std::filesystem::remove(log_sink_path);
+
+  LiteRtLmSettings settings;
+  settings.backend = "gpu";
+  settings.benchmark = true;
+  settings.benchmark_prefill_tokens = 256;
+  settings.benchmark_decode_tokens = 256;
+  settings.benchmark_append_chunks = 4;
+  settings.log_sink_file = log_sink_path.string();
+
+  LitertLmMetrics m1;
+  m1.benchmark_info = CreateMultiPrefillBenchmarkInfo();
+  m1.peak_mem_mb = 1450.0f;
+  LitertLmMetrics m2;
+  m2.benchmark_info = CreateMultiPrefillBenchmarkInfo();
+  m2.peak_mem_mb = 1550.0f;
+
+  {
+    FileLogSink sink(log_sink_path.string());
+    absl::AddLogSink(&sink);
+    LogBenchmarkInfo(*m1.benchmark_info, settings);
+    LogAggregatedMetrics(ComputeMedianMetrics({m1, m2}), settings);
+    absl::RemoveLogSink(&sink);
+  }
+
+  std::ifstream log_file(log_sink_path);
+  ASSERT_TRUE(log_file.is_open());
+  const std::string log_contents((std::istreambuf_iterator<char>(log_file)),
+                                 std::istreambuf_iterator<char>());
+  EXPECT_THAT(
+      log_contents,
+      testing::HasSubstr(
+          "] Benchmark flags: "
+          "benchmark_prefill_tokens=256,benchmark_decode_tokens=256,"
+          "backend=gpu,append_chunks=4\n"));
+  for (int i = 0; i < 5; ++i) {
+    EXPECT_THAT(log_contents,
+                testing::HasSubstr(absl::StrCat("] Prefill speed turn ", i,
+                                                ": ")));
+  }
+  EXPECT_THAT(log_contents,
+              testing::HasSubstr("] Decode speed turn 0: "));
+  // Decode runs only once per multi-prefill pass, so no extra decode turns
+  // may be emitted even though 5 prefill turns were recorded.
+  EXPECT_THAT(log_contents,
+              testing::Not(testing::HasSubstr("] Decode speed turn 1:")));
+  EXPECT_THAT(log_contents,
+              testing::HasSubstr("] Aggregated metrics (median of 2 runs)\n"));
+  EXPECT_THAT(log_contents,
+              testing::HasSubstr("] Peak system ram usage: 1500.00 MB\n"));
 }
 
 }  // namespace

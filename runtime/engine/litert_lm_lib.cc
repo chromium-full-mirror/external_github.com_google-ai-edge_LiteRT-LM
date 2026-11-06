@@ -521,6 +521,8 @@ absl::StatusOr<std::vector<litert::lm::ScorerOutput>> RunScoreText(
   return scorer_outputs;
 }
 
+}  // namespace
+
 void LogBenchmarkInfo(const litert::lm::BenchmarkInfo& benchmark_info,
                       const LiteRtLmSettings& settings) {
   if (!settings.log_sink_file.has_value()) {
@@ -550,6 +552,10 @@ void LogBenchmarkInfo(const litert::lm::BenchmarkInfo& benchmark_info,
         !settings.audio_backend->empty()) {
       absl::StrAppend(&extra_flags, ",audio_backend=", *settings.audio_backend);
     }
+    if (settings.benchmark_append_chunks > 0) {
+      absl::StrAppend(&extra_flags,
+                      ",append_chunks=", settings.benchmark_append_chunks);
+    }
     ABSL_LOG(INFO) << absl::StrFormat(
         "Benchmark flags: "
         "benchmark_prefill_tokens=%d,benchmark_decode_tokens=%d,backend=%s%s",
@@ -566,16 +572,20 @@ void LogBenchmarkInfo(const litert::lm::BenchmarkInfo& benchmark_info,
     }
     ABSL_LOG(INFO) << absl::StrFormat("Time to first token: %.2f s",
                                       benchmark_info.GetTimeToFirstToken());
-    for (int i = 0; i < benchmark_info.GetTotalPrefillTurns(); ++i) {
+    for (uint64_t i = 0; i < benchmark_info.GetTotalPrefillTurns(); ++i) {
       ABSL_LOG(INFO) << absl::StrFormat(
-          "Prefill speed turn %d: %.2f tk/s", i,
-          benchmark_info.GetPrefillTokensPerSec(i));
+          "Prefill speed turn %d: %.2f tk/s", static_cast<int>(i),
+          benchmark_info.GetPrefillTokensPerSec(static_cast<int>(i)));
+    }
+    for (uint64_t i = 0; i < benchmark_info.GetTotalDecodeTurns(); ++i) {
       ABSL_LOG(INFO) << absl::StrFormat(
-          "Decode speed turn %d: %.2f tk/s", i,
-          benchmark_info.GetDecodeTokensPerSec(i));
+          "Decode speed turn %d: %.2f tk/s", static_cast<int>(i),
+          benchmark_info.GetDecodeTokensPerSec(static_cast<int>(i)));
     }
   }
 }
+
+namespace {
 
 // Logs the peak accelerator memory usage: the headline total, the per-category
 // breakdown and the largest individual allocations.
@@ -696,6 +706,8 @@ std::string FormatAggregatedAcceleratorMemoryBreakdown(
       });
 }
 
+}  // namespace
+
 // Logs the aggregated (median) metrics of a multi-iteration benchmark run.
 //
 // The metric labels are deliberately identical to the ones used by
@@ -813,6 +825,8 @@ void LogAggregatedMetrics(const AggregatedLitertLmMetrics& aggregated,
     }
   }
 }
+
+namespace {
 }  // namespace
 
 absl::StatusOr<EngineSettings> CreateEngineSettings(
@@ -1092,6 +1106,32 @@ absl::StatusOr<EngineSettings> CreateEngineSettings(
                    << engine_settings.GetAudioExecutorSettings().value();
   } else {
     ABSL_LOG(INFO) << "audio_executor_settings: not set";
+  }
+
+  if (settings.benchmark_append_chunks < 0) {
+    return absl::InvalidArgumentError(
+        absl::StrCat("benchmark_append_chunks must be >= 0, but got ",
+                     settings.benchmark_append_chunks, "."));
+  }
+  if (settings.benchmark_append_chunks > 0) {
+    if (!settings.benchmark) {
+      return absl::InvalidArgumentError(
+          "benchmark_append_chunks requires --benchmark=true.");
+    }
+    if (settings.use_session) {
+      return absl::InvalidArgumentError(
+          "benchmark_append_chunks is not compatible with --use_session.");
+    }
+    if (settings.multi_turns) {
+      return absl::InvalidArgumentError(
+          "benchmark_append_chunks is not compatible with --multi_turns.");
+    }
+    if (settings.score_target_text.has_value() &&
+        !settings.score_target_text->empty()) {
+      return absl::InvalidArgumentError(
+          "benchmark_append_chunks is not compatible with "
+          "--score_target_text.");
+    }
   }
 
   if (settings.benchmark) {
