@@ -280,10 +280,7 @@ absl::StatusOr<std::unique_ptr<Constraint>> CreateRegexConstraint(
                               .constraint_string = constraint_regex});
 }
 
-absl::StatusOr<Message> RunSingleTurnConversation(
-    const json& content_list, const LiteRtLmSettings& settings,
-    litert::lm::Engine* engine, Conversation* conversation) {
-  std::stringstream captured_output;
+OptionalArgs CreateConversationDecodeArgs(const LiteRtLmSettings& settings) {
   OptionalArgs optional_args;
   if (settings.repetition_penalty_config.enabled()) {
     optional_args.repetition_penalty_config =
@@ -298,57 +295,98 @@ absl::StatusOr<Message> RunSingleTurnConversation(
   if (settings.max_output_tokens > 0) {
     optional_args.max_output_tokens = settings.max_output_tokens;
   }
-  if (settings.visual_token_budget > 0 && conversation->GetConfig()
+  return optional_args;
+}
+
+void MaybeSetVisualTokenBudget(const LiteRtLmSettings& settings,
+                               const Conversation& conversation,
+                               OptionalArgs& optional_args) {
+  if (settings.visual_token_budget > 0 && conversation.GetConfig()
                                               .GetSessionConfig()
                                               .GetLlmModelType()
                                               .has_gemma4()) {
     optional_args.args = Gemma4DataProcessorArguments{
         .visual_token_budget = settings.visual_token_budget};
   }
+}
 
-  // Skip printing the output when using fake prefill tokens.
-  bool should_print_output = settings.benchmark_prefill_tokens == 0;
+OptionalArgs CreateConversationMessageArgs(const LiteRtLmSettings& settings,
+                                           const Conversation& conversation) {
+  OptionalArgs optional_args = CreateConversationDecodeArgs(settings);
+  MaybeSetVisualTokenBudget(settings, conversation, optional_args);
+  return optional_args;
+}
+
+OptionalArgs CreateConversationAppendArgs(const LiteRtLmSettings& settings,
+                                          const Conversation& conversation) {
+  OptionalArgs optional_args;
+  optional_args.has_pending_message = true;
+  MaybeSetVisualTokenBudget(settings, conversation, optional_args);
+  return optional_args;
+}
+
+absl::Status SendConversationMessage(const LiteRtLmSettings& settings,
+                                     Engine* engine,
+                                     Conversation* conversation,
+                                     const Message& message,
+                                     OptionalArgs optional_args,
+                                     bool allow_printing) {
+  const bool should_print_output =
+      allow_printing && settings.benchmark_prefill_tokens == 0;
   if (settings.async) {
     auto callback_state = std::make_shared<AsyncMessageCallbackState>();
-    absl::AnyInvocable<void(absl::StatusOr<Message>)> print_message_callback =
+    absl::AnyInvocable<void(absl::StatusOr<Message>)> callback =
         should_print_output
             ? CreatePrintMessageCallback(callback_state)
             : absl::AnyInvocable<void(absl::StatusOr<Message>)>(
-                  [callback_state](absl::StatusOr<Message> message) {
-                    if (!message.ok()) {
-                      callback_state->RecordError(message.status());
+                  [callback_state](absl::StatusOr<Message> response) {
+                    if (!response.ok()) {
+                      callback_state->RecordError(response.status());
                     }
                   });
     ABSL_RETURN_IF_ERROR(conversation->SendMessageAsync(
-        json::object({{"role", "user"}, {"content", content_list}}),
-        std::move(print_message_callback), std::move(optional_args)));
+        message, std::move(callback), std::move(optional_args)));
     if (absl::Status wait_status = engine->WaitUntilDone(kWaitUntilDoneTimeout);
         !wait_status.ok()) {
       conversation->CancelProcess();
       return wait_status;
     }
     ABSL_RETURN_IF_ERROR(callback_state->GetStatus());
-    ABSL_RETURN_IF_ERROR(
-        CheckExpectedOutput(callback_state->GetCapturedOutput(), settings));
-    const auto history = conversation->GetHistory();
-    if (history.empty()) {
-      return absl::InternalError(
-          "Conversation history is empty after SendMessageAsync.");
+    if (allow_printing) {
+      ABSL_RETURN_IF_ERROR(
+          CheckExpectedOutput(callback_state->GetCapturedOutput(), settings));
     }
-    return history.back();
-  } else {
-    ABSL_ASSIGN_OR_RETURN(
-        auto model_message,
-        conversation->SendMessage(
-            json::object({{"role", "user"}, {"content", content_list}}),
-            std::move(optional_args)));
-    if (should_print_output) {
-      ABSL_RETURN_IF_ERROR(PrintMessage(model_message, captured_output, nullptr,
-                                        /*streaming=*/false));
-    }
-    ABSL_RETURN_IF_ERROR(CheckExpectedOutput(captured_output.str(), settings));
-    return model_message;
+    return absl::OkStatus();
   }
+  ABSL_ASSIGN_OR_RETURN(
+      auto model_message,
+      conversation->SendMessage(message, std::move(optional_args)));
+  std::stringstream captured_output;
+  if (should_print_output) {
+    ABSL_RETURN_IF_ERROR(PrintMessage(model_message, captured_output, nullptr,
+                                      /*streaming=*/false));
+  }
+  if (allow_printing) {
+    ABSL_RETURN_IF_ERROR(CheckExpectedOutput(captured_output.str(), settings));
+  }
+  return absl::OkStatus();
+}
+
+absl::StatusOr<Message> RunSingleTurnConversation(
+    const json& content_list, const LiteRtLmSettings& settings,
+    litert::lm::Engine* engine, Conversation* conversation) {
+  OptionalArgs optional_args =
+      CreateConversationMessageArgs(settings, *conversation);
+  ABSL_RETURN_IF_ERROR(SendConversationMessage(
+      settings, engine, conversation,
+      json::object({{"role", "user"}, {"content", content_list}}),
+      std::move(optional_args), /*allow_printing=*/true));
+  const auto history = conversation->GetHistory();
+  if (history.empty()) {
+    return absl::InternalError(
+        "Conversation history is empty after RunSingleTurnConversation.");
+  }
+  return history.back();
 }
 
 absl::Status RunMultiTurnConversation(const LiteRtLmSettings& settings,
@@ -375,27 +413,8 @@ absl::Status RunMultiTurnConversation(const LiteRtLmSettings& settings,
     if (content_list.empty()) {
       continue;
     }
-    OptionalArgs optional_args;
-    if (settings.repetition_penalty_config.enabled()) {
-      optional_args.repetition_penalty_config =
-          settings.repetition_penalty_config;
-    }
-    if (settings.no_repeat_ngram_config.enabled()) {
-      optional_args.no_repeat_ngram_config = settings.no_repeat_ngram_config;
-    }
-    if (settings.suppress_tokens_config.enabled()) {
-      optional_args.suppress_tokens_config = settings.suppress_tokens_config;
-    }
-    if (settings.max_output_tokens > 0) {
-      optional_args.max_output_tokens = settings.max_output_tokens;
-    }
-    if (settings.visual_token_budget > 0 && conversation->GetConfig()
-                                                .GetSessionConfig()
-                                                .GetLlmModelType()
-                                                .has_gemma4()) {
-      optional_args.args = Gemma4DataProcessorArguments{
-          .visual_token_budget = settings.visual_token_budget};
-    }
+    OptionalArgs optional_args =
+        CreateConversationMessageArgs(settings, *conversation);
 
     if (settings.async) {
       auto callback_state = std::make_shared<AsyncMessageCallbackState>();
@@ -521,6 +540,8 @@ absl::StatusOr<std::vector<litert::lm::ScorerOutput>> RunScoreText(
   return scorer_outputs;
 }
 
+}  // namespace
+
 void LogBenchmarkInfo(const litert::lm::BenchmarkInfo& benchmark_info,
                       const LiteRtLmSettings& settings) {
   if (!settings.log_sink_file.has_value()) {
@@ -550,6 +571,10 @@ void LogBenchmarkInfo(const litert::lm::BenchmarkInfo& benchmark_info,
         !settings.audio_backend->empty()) {
       absl::StrAppend(&extra_flags, ",audio_backend=", *settings.audio_backend);
     }
+    if (settings.benchmark_append_chunks > 0) {
+      absl::StrAppend(&extra_flags,
+                      ",append_chunks=", settings.benchmark_append_chunks);
+    }
     ABSL_LOG(INFO) << absl::StrFormat(
         "Benchmark flags: "
         "benchmark_prefill_tokens=%d,benchmark_decode_tokens=%d,backend=%s%s",
@@ -566,16 +591,20 @@ void LogBenchmarkInfo(const litert::lm::BenchmarkInfo& benchmark_info,
     }
     ABSL_LOG(INFO) << absl::StrFormat("Time to first token: %.2f s",
                                       benchmark_info.GetTimeToFirstToken());
-    for (int i = 0; i < benchmark_info.GetTotalPrefillTurns(); ++i) {
+    for (uint64_t i = 0; i < benchmark_info.GetTotalPrefillTurns(); ++i) {
       ABSL_LOG(INFO) << absl::StrFormat(
-          "Prefill speed turn %d: %.2f tk/s", i,
-          benchmark_info.GetPrefillTokensPerSec(i));
+          "Prefill speed turn %d: %.2f tk/s", static_cast<int>(i),
+          benchmark_info.GetPrefillTokensPerSec(static_cast<int>(i)));
+    }
+    for (uint64_t i = 0; i < benchmark_info.GetTotalDecodeTurns(); ++i) {
       ABSL_LOG(INFO) << absl::StrFormat(
-          "Decode speed turn %d: %.2f tk/s", i,
-          benchmark_info.GetDecodeTokensPerSec(i));
+          "Decode speed turn %d: %.2f tk/s", static_cast<int>(i),
+          benchmark_info.GetDecodeTokensPerSec(static_cast<int>(i)));
     }
   }
 }
+
+namespace {
 
 // Logs the peak accelerator memory usage: the headline total, the per-category
 // breakdown and the largest individual allocations.
@@ -696,6 +725,8 @@ std::string FormatAggregatedAcceleratorMemoryBreakdown(
       });
 }
 
+}  // namespace
+
 // Logs the aggregated (median) metrics of a multi-iteration benchmark run.
 //
 // The metric labels are deliberately identical to the ones used by
@@ -813,6 +844,8 @@ void LogAggregatedMetrics(const AggregatedLitertLmMetrics& aggregated,
     }
   }
 }
+
+namespace {
 }  // namespace
 
 absl::StatusOr<EngineSettings> CreateEngineSettings(
@@ -1094,6 +1127,32 @@ absl::StatusOr<EngineSettings> CreateEngineSettings(
     ABSL_LOG(INFO) << "audio_executor_settings: not set";
   }
 
+  if (settings.benchmark_append_chunks < 0) {
+    return absl::InvalidArgumentError(
+        absl::StrCat("benchmark_append_chunks must be >= 0, but got ",
+                     settings.benchmark_append_chunks, "."));
+  }
+  if (settings.benchmark_append_chunks > 0) {
+    if (!settings.benchmark) {
+      return absl::InvalidArgumentError(
+          "benchmark_append_chunks requires --benchmark=true.");
+    }
+    if (settings.use_session) {
+      return absl::InvalidArgumentError(
+          "benchmark_append_chunks is not compatible with --use_session.");
+    }
+    if (settings.multi_turns) {
+      return absl::InvalidArgumentError(
+          "benchmark_append_chunks is not compatible with --multi_turns.");
+    }
+    if (settings.score_target_text.has_value() &&
+        !settings.score_target_text->empty()) {
+      return absl::InvalidArgumentError(
+          "benchmark_append_chunks is not compatible with "
+          "--score_target_text.");
+    }
+  }
+
   if (settings.benchmark) {
     if (settings.multi_turns && settings.async) {
       // TODO(b/483699181) - Support benchmarking for multi-turns and async.
@@ -1349,6 +1408,75 @@ absl::StatusOr<nlohmann::json> BuildContentList(
   return content_list;
 }
 
+absl::Status RunMultiPrefillConversation(const LiteRtLmSettings& settings,
+                                         Engine* engine,
+                                         Conversation* conversation) {
+  if (engine == nullptr || conversation == nullptr) {
+    return absl::InvalidArgumentError(
+        "Engine and Conversation must not be null.");
+  }
+  if (settings.benchmark_append_chunks <= 0) {
+    return absl::InvalidArgumentError("benchmark_append_chunks must be > 0.");
+  }
+  if (!conversation->GetConfig()
+           .GetPromptTemplate()
+           .GetCapabilities()
+           .supports_single_turn) {
+    return absl::FailedPreconditionError(
+        "Model prompt template does not support incremental prefill "
+        "(is_appending_to_prefill) required for --benchmark_append_chunks.");
+  }
+  if (conversation->GetConfig().filter_channel_content_from_kv_cache()) {
+    return absl::FailedPreconditionError(
+        "Conversation must disable filter_channel_content_from_kv_cache for "
+        "--benchmark_append_chunks.");
+  }
+
+  // Ensure every appended chunk carries non-empty text so Continuation chunks
+  // always trigger a Session prefill rather than returning early on empty
+  // rendered template text.
+  const std::string fallback_prompt =
+      settings.input_prompt.empty() ? "Hello world." : settings.input_prompt;
+  std::vector<InputData> first_chunk_inputs;
+  first_chunk_inputs.push_back(InputText(fallback_prompt));
+  ABSL_ASSIGN_OR_RETURN(const nlohmann::json first_chunk_content,
+                        BuildContentList(first_chunk_inputs, settings));
+
+  nlohmann::json continuation_chunk_content = first_chunk_content;
+  if (settings.benchmark_append_chunks > 1) {
+    static const RE2* const kMediaTagRe =
+        new RE2(R"(\[(image|audio):([^\s\]]+)\])");
+    std::string continuation_text = fallback_prompt;
+    if (RE2::GlobalReplace(&continuation_text, *kMediaTagRe, "") > 0) {
+      if (continuation_text.find_first_not_of(' ') == std::string::npos) {
+        continuation_text = "Continue.";
+      }
+      std::vector<InputData> continuation_inputs;
+      continuation_inputs.push_back(InputText(continuation_text));
+      ABSL_ASSIGN_OR_RETURN(continuation_chunk_content,
+                            BuildContentList(continuation_inputs, settings));
+    }
+  }
+
+  for (int chunk = 0; chunk < settings.benchmark_append_chunks; ++chunk) {
+    const nlohmann::json& chunk_content =
+        chunk == 0 ? first_chunk_content : continuation_chunk_content;
+    OptionalArgs append_args =
+        CreateConversationAppendArgs(settings, *conversation);
+    ABSL_RETURN_IF_ERROR(SendConversationMessage(
+        settings, engine, conversation,
+        Message{{"role", "user"}, {"content", chunk_content}},
+        std::move(append_args), /*allow_printing=*/false));
+  }
+
+  OptionalArgs decode_args = CreateConversationDecodeArgs(settings);
+  decode_args.has_pending_message = false;
+  return SendConversationMessage(settings, engine, conversation,
+                                 Message{{"role", "user"}, {"content", ""}},
+                                 std::move(decode_args),
+                                 /*allow_printing=*/true);
+}
+
 absl::Status RunLiteRtLm(const LiteRtLmSettings& settings,
                          std::vector<LitertLmMetrics>* metrics) {
   std::optional<ScopedFileLogSink> log_sink;
@@ -1414,13 +1542,20 @@ absl::Status RunLiteRtLm(const LiteRtLmSettings& settings,
       }
     } else {
       ABSL_LOG(INFO) << "Creating conversation";
+      ConversationConfig::Builder config_builder;
+      config_builder.SetSessionConfig(session_config);
+      if (settings.benchmark_append_chunks > 0) {
+        config_builder.SetFilterChannelContentFromKvCache(false);
+      }
       ABSL_ASSIGN_OR_RETURN(auto conversation_config,
-                            ConversationConfig::Builder()
-                                .SetSessionConfig(session_config)
-                                .Build(*engine));
+                            config_builder.Build(*engine));
       ABSL_ASSIGN_OR_RETURN(conversation,
                             Conversation::Create(*engine, conversation_config));
-      if (settings.multi_turns) {
+      if (settings.benchmark_append_chunks > 0) {
+        ABSL_LOG(INFO) << "Running multi-prefill conversation benchmark";
+        ABSL_RETURN_IF_ERROR(RunMultiPrefillConversation(
+            settings, engine.get(), conversation.get()));
+      } else if (settings.multi_turns) {
         ABSL_LOG(INFO) << "Running multi-turns conversation";
         ABSL_RETURN_IF_ERROR(RunMultiTurnConversation(settings, engine.get(),
                                                       conversation.get()));

@@ -39,6 +39,7 @@
 #include "runtime/components/constrained_decoding/no_repeat_ngram_config.h"
 #include "runtime/components/constrained_decoding/repetition_penalty_config.h"
 #include "runtime/components/constrained_decoding/suppress_tokens_config.h"
+#include "runtime/conversation/conversation.h"
 #include "runtime/engine/engine.h"
 #include "runtime/engine/engine_settings.h"
 #include "runtime/engine/io_types.h"
@@ -103,6 +104,10 @@ struct LiteRtLmSettings {
   bool enable_debugger = false;
   int benchmark_prefill_tokens = 0;
   int benchmark_decode_tokens = 0;
+  // Number of user message chunks appended with `has_pending_message = true`
+  // before closing the turn with an empty message (`has_pending_message =
+  // false`) and decoding once. `0` runs the standard single-message path.
+  int benchmark_append_chunks = 0;
   bool async = true;
   // Reports the peak host memory of the process. On supported devices, the
   // accelerator memory may also be reported.
@@ -232,6 +237,15 @@ struct AggregatedLitertLmMetrics {
 AggregatedLitertLmMetrics ComputeMedianMetrics(
     const std::vector<LitertLmMetrics>& metrics);
 
+// Logs single-iteration benchmark metrics to INFO (and any registered log
+// sinks, e.g. when `settings.log_sink_file` is set).
+void LogBenchmarkInfo(const BenchmarkInfo& benchmark_info,
+                      const LiteRtLmSettings& settings);
+
+// Logs aggregated multi-iteration median benchmark metrics to INFO.
+void LogAggregatedMetrics(const AggregatedLitertLmMetrics& aggregated,
+                          const LiteRtLmSettings& settings);
+
 // Builds the content list from the input data.
 absl::StatusOr<nlohmann::json> BuildContentList(
     const std::vector<InputData>& input_data, const LiteRtLmSettings& settings);
@@ -252,6 +266,16 @@ SessionConfig CreateSessionConfig(const LiteRtLmSettings& settings);
 // the inference. Results from each iteration is saved in the vector.
 absl::Status RunLiteRtLm(const LiteRtLmSettings& settings,
                          std::vector<LitertLmMetrics>* metrics = nullptr);
+
+// Runs a non-interactive multi-prefill Conversation benchmark that appends
+// `settings.benchmark_append_chunks` user chunks via
+// `has_pending_message = true` and then closes the turn with an empty message
+// via `has_pending_message = false` to trigger a single decode pass.
+// `conversation` must be configured with
+// `filter_channel_content_from_kv_cache = false`.
+absl::Status RunMultiPrefillConversation(const LiteRtLmSettings& settings,
+                                         Engine* engine,
+                                         Conversation* conversation);
 
 // Returns true if stdout is a TTY and colors should be used.
 bool UseColor();
