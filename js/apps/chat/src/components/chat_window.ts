@@ -24,15 +24,19 @@ import {customElement, property, query, state} from 'lit/decorators.js';
 
 import {LlmChatStateController} from '../state_controller.js';
 import {getDisabledMediaMessage, MediaKind, promptHasContent, PromptMedia, PromptPart, promptPartsToText} from '../stores/chat_session_store.js';
+import {buildModelCodeSnippet, type CodeSnippetVariant, getNpmInstallCommand, isUnreleasedCoreBuild} from '../stores/code_snippet.js';
 import {getModelKey} from '../stores/model_loader_service.js';
 import {getMediaUiCopy, getModalityConfigs, type MediaUiCopy} from '../stores/settings_store.js';
 import {sharedStyles} from '../styles/shared_styles.js';
 import {AudioRecorder, toSupportedAudio} from '../utils/audio.js';
+import {copyToClipboard} from '../utils/clipboard.js';
 import type {LitertCameraCapture} from './camera_capture.js';
 import {chatWindowStyles} from './chat_window_styles.js';
 import type {CustomDropdown} from './custom_dropdown.js';
-import {focusNowAndNextFrame} from './focus_util.js';
+import {focusNowAndNextFrame, trapTabKey} from './focus_util.js';
+import {getLanguage, highlight} from './hljs_util.js';
 import {addRemoteModelFromInput, getActiveModelSummary, modelSelectorStyles, renderModelDropdownItems, selectModelWithLargeModelCheck, triggerLitertModelUpload} from './model_selector_shared.js';
+import {renderHtml} from './util.js';
 
 /* tslint:disable:no-new-decorators */
 
@@ -91,6 +95,7 @@ const CAPABILITY_MODALITY_ICONS:
           svg`<rect x="3" y="3" width="18" height="18" rx="2" ry="2"></rect><circle cx="8.5" cy="8.5" r="1.5"></circle><polyline points="21 15 16 10 5 21"></polyline>`,
     };
 
+const CODE_VARIANT_STORAGE_KEY = 'litertlm-code-snippet-variant';
 /** Main chat window component managing messages and input. */
 @customElement('litert-chat-window')
 export class LitertChatWindow extends LitElement {
@@ -115,6 +120,10 @@ export class LitertChatWindow extends LitElement {
   @state() private isModelMenuOpen = false;
   @state() private isAddingModel = false;
   @state() private isLookingUpModel = false;
+  @state() private isCodePopoverOpen = false;
+  @state() private codeVariant: CodeSnippetVariant = 'npm';
+  @state() private codeCopied = false;
+  private codeCopyResetTimer: number|undefined;
   @state()
   private isCompactViewport =
       typeof window !== 'undefined' ? window.innerWidth <= 600 : false;
@@ -209,6 +218,9 @@ export class LitertChatWindow extends LitElement {
 
   override disconnectedCallback() {
     document.removeEventListener('click', this.handleAddModelOutsideClick);
+    document.removeEventListener('click', this.handleCodePopoverOutsideClick);
+    window.clearTimeout(this.codeCopyResetTimer);
+    this.codeCopyResetTimer = undefined;
     if (typeof window !== 'undefined') {
       window.removeEventListener('keydown', this.handleGlobalScrollKeyDown);
     }
@@ -947,6 +959,9 @@ export class LitertChatWindow extends LitElement {
     if (this.isAddingModel) {
       this.closeComposerAddModel(false);
     }
+    if (this.isCodePopoverOpen) {
+      this.closeCodePopover(false);
+    }
     this.modelDropdown?.open();
     this.modelDropdown?.focusButton();
   }
@@ -964,8 +979,8 @@ export class LitertChatWindow extends LitElement {
   }
 
   /**
-   * Dismisses any open model picker menu or Add-URL popover in the composer,
-   * returning true when an open control was closed.
+   * Dismisses any open model picker menu, Add-URL popover, or Get-Code popover
+   * in the composer, returning true when an open control was closed.
    */
   dismissTransientMenus(): boolean {
     if (this.modelDropdown?.isOpen) {
@@ -977,6 +992,10 @@ export class LitertChatWindow extends LitElement {
       this.closeComposerAddModel(true);
       return true;
     }
+    if (this.isCodePopoverOpen) {
+      this.closeCodePopover(true);
+      return true;
+    }
     return false;
   }
 
@@ -985,6 +1004,152 @@ export class LitertChatWindow extends LitElement {
     this.modelDropdown?.close();
     if (this.isAddingModel) {
       this.closeComposerAddModel(false);
+    }
+    if (this.isCodePopoverOpen) {
+      this.closeCodePopover(false);
+    }
+  }
+
+  private readonly handleCodePopoverOutsideClick = (e: MouseEvent) => {
+    if (!this.isCodePopoverOpen) return;
+    const btn = this.renderRoot.querySelector<HTMLElement>('#btn-get-code');
+    const popover =
+        this.renderRoot.querySelector<HTMLElement>('#composer-code-popover');
+    const path = typeof e.composedPath === 'function' ? e.composedPath() : [];
+    const target = e.target as Node | null;
+    const insideBtn = Boolean(
+        btn && (path.includes(btn) || (target && btn.contains(target))));
+    const insidePopover = Boolean(
+        popover &&
+        (path.includes(popover) || (target && popover.contains(target))));
+    if (!insideBtn && !insidePopover) {
+      this.closeCodePopover(false);
+    }
+  };
+
+  private getCodeVariantStorage(): Storage|undefined {
+    try {
+      return this.state?.storage ?? window.localStorage;
+    } catch {
+      return undefined;
+    }
+  }
+
+  private loadSavedCodeVariant(): CodeSnippetVariant {
+    try {
+      const saved = this.getCodeVariantStorage()?.getItem(
+          CODE_VARIANT_STORAGE_KEY);
+      return saved === 'html' ? 'html' : 'npm';
+    } catch {
+      return 'npm';
+    }
+  }
+
+  private selectCodeVariant(
+      variant: CodeSnippetVariant, moveFocus = false) {
+    if (this.codeVariant !== variant) {
+      this.codeVariant = variant;
+      this.codeCopied = false;
+      window.clearTimeout(this.codeCopyResetTimer);
+      this.codeCopyResetTimer = undefined;
+    }
+    try {
+      this.getCodeVariantStorage()?.setItem(CODE_VARIANT_STORAGE_KEY, variant);
+    } catch {
+      // Ignore storage quota / privacy-mode errors.
+    }
+    if (moveFocus) {
+      void this.updateComplete.then(() => {
+        this.renderRoot
+            .querySelector<HTMLButtonElement>(`#tab-code-${variant}`)
+            ?.focus();
+      });
+    }
+  }
+
+  private readonly handleCodeVariantTabKeyDown = (e: KeyboardEvent) => {
+    if (e.key === 'ArrowRight' || e.key === 'ArrowLeft') {
+      e.preventDefault();
+      const next: CodeSnippetVariant =
+          this.codeVariant === 'npm' ? 'html' : 'npm';
+      this.selectCodeVariant(next, true);
+    } else if (e.key === 'Home') {
+      e.preventDefault();
+      this.selectCodeVariant('npm', true);
+    } else if (e.key === 'End') {
+      e.preventDefault();
+      this.selectCodeVariant('html', true);
+    }
+  };
+
+  private toggleCodePopover() {
+    if (this.isCodePopoverOpen) {
+      this.closeCodePopover(true);
+      return;
+    }
+    this.modelDropdown?.close();
+    if (this.isAddingModel) {
+      this.closeComposerAddModel(false);
+    }
+    this.codeVariant = this.loadSavedCodeVariant();
+    this.codeCopied = false;
+    this.isCodePopoverOpen = true;
+    setTimeout(() => {
+      if (this.isConnected && this.isCodePopoverOpen) {
+        document.addEventListener('click', this.handleCodePopoverOutsideClick);
+      }
+    }, 0);
+    void this.updateComplete.then(() => {
+      focusNowAndNextFrame(() => {
+        if (!this.isCodePopoverOpen) return;
+        this.renderRoot
+            .querySelector<HTMLButtonElement>('#btn-copy-model-code')
+            ?.focus();
+      });
+    });
+  }
+
+  private closeCodePopover(restoreFocus = false) {
+    this.isCodePopoverOpen = false;
+    document.removeEventListener('click', this.handleCodePopoverOutsideClick);
+    window.clearTimeout(this.codeCopyResetTimer);
+    this.codeCopyResetTimer = undefined;
+    this.codeCopied = false;
+    if (restoreFocus) {
+      void this.updateComplete.then(() => {
+        this.renderRoot.querySelector<HTMLButtonElement>('#btn-get-code')
+            ?.focus();
+      });
+    }
+  }
+
+  private handleCodePopoverKeyDown(e: KeyboardEvent) {
+    if (e.key === 'Escape') {
+      e.preventDefault();
+      e.stopPropagation();
+      this.closeCodePopover(true);
+      return;
+    }
+    if (e.key === 'Tab') {
+      const popover =
+          this.renderRoot.querySelector<HTMLElement>('#composer-code-popover');
+      if (popover) {
+        trapTabKey(e, popover);
+      }
+    }
+  }
+
+  private async copyModelCode(snippet: string) {
+    try {
+      await copyToClipboard(snippet);
+      this.codeCopied = true;
+      window.clearTimeout(this.codeCopyResetTimer);
+      this.codeCopyResetTimer = window.setTimeout(() => {
+        this.codeCopied = false;
+        this.codeCopyResetTimer = undefined;
+      }, 2000);
+    } catch (err) {
+      console.error('[LiteRT-LM] Failed to copy code snippet:', err);
     }
   }
 
@@ -1008,6 +1173,9 @@ export class LitertChatWindow extends LitElement {
   };
 
   private openComposerAddModel() {
+    if (this.isCodePopoverOpen) {
+      this.closeCodePopover(false);
+    }
     this.isAddingModel = true;
     setTimeout(() => {
       if (this.isConnected && this.isAddingModel) {
@@ -1169,6 +1337,12 @@ export class LitertChatWindow extends LitElement {
         CAPABILITY_MODALITY_ICONS[mediaUi.capabilityIcon];
     const runtimeLead =
         modalities.text.backend === 'cpu' ? 'in WASM' : 'with WebGPU';
+    const codeSnippet = this.isCodePopoverOpen ?
+        buildModelCodeSnippet(this.state.settings, this.codeVariant) :
+        '';
+    const codeHighlightLang = this.codeVariant === 'html' ?
+        (getLanguage('html') ? 'html' : 'xml') :
+        'typescript';
 
     return html`
       <!-- Top Error Banner -->
@@ -1411,6 +1585,122 @@ export class LitertChatWindow extends LitElement {
             @paste=${this.handleEditorPaste}
           ></div>
 
+          ${this.isCodePopoverOpen ? html`
+            <div
+              id="composer-code-popover"
+              class="composer-code-popover"
+              role="dialog"
+              aria-modal="false"
+              aria-labelledby="composer-code-title"
+              @keydown=${this.handleCodePopoverKeyDown}
+            >
+              <div class="code-popover-header">
+                <div class="code-popover-title-wrap">
+                  <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                    <polyline points="16 18 22 12 16 6"></polyline>
+                    <polyline points="8 6 2 12 8 18"></polyline>
+                  </svg>
+                  <span id="composer-code-title" class="code-popover-title">Use with @litert-lm/core</span>
+                  <span class="code-popover-model-pill" title=${cleanModelName}>${cleanModelName}</span>
+                </div>
+                <div class="code-popover-actions">
+                  <button
+                    id="btn-copy-model-code"
+                    type="button"
+                    class="btn-copy-snippet ${this.codeCopied ? 'copied' : ''}"
+                    @click=${() => this.copyModelCode(codeSnippet)}
+                  >
+                    ${this.codeCopied ? html`
+                      <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                        <polyline points="20 6 9 17 4 12"></polyline>
+                      </svg>
+                      <span>Copied</span>
+                    ` : html`
+                      <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                        <rect x="9" y="9" width="13" height="13" rx="2" ry="2"></rect>
+                        <path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path>
+                      </svg>
+                      <span>Copy code</span>
+                    `}
+                  </button>
+                  <button
+                    id="btn-close-code-popover"
+                    type="button"
+                    class="btn-close-code-popover"
+                    aria-label="Close code snippet"
+                    title="Close"
+                    @click=${() => this.closeCodePopover(true)}
+                  >✕</button>
+                </div>
+              </div>
+              <div class="code-popover-subbar">
+                <div
+                  class="code-variant-tabs"
+                  role="tablist"
+                  aria-label="Code sample format"
+                >
+                  <button
+                    id="tab-code-npm"
+                    type="button"
+                    role="tab"
+                    class="code-variant-tab ${
+                        this.codeVariant === 'npm' ? 'active' : ''}"
+                    aria-selected=${
+                        this.codeVariant === 'npm' ? 'true' : 'false'}
+                    aria-controls="code-popover-panel"
+                    tabindex=${this.codeVariant === 'npm' ? '0' : '-1'}
+                    @click=${() => this.selectCodeVariant('npm')}
+                    @keydown=${this.handleCodeVariantTabKeyDown}
+                  >npm</button>
+                  <button
+                    id="tab-code-html"
+                    type="button"
+                    role="tab"
+                    class="code-variant-tab ${
+                        this.codeVariant === 'html' ? 'active' : ''}"
+                    aria-selected=${
+                        this.codeVariant === 'html' ? 'true' : 'false'}
+                    aria-controls="code-popover-panel"
+                    tabindex=${this.codeVariant === 'html' ? '0' : '-1'}
+                    @click=${() => this.selectCodeVariant('html')}
+                    @keydown=${this.handleCodeVariantTabKeyDown}
+                  >HTML</button>
+                </div>
+                ${isUnreleasedCoreBuild() ? html`
+                  <span
+                    id="code-popover-unreleased-note"
+                    class="code-popover-unreleased-note"
+                  >Unreleased build — this sample targets the next @litert-lm/core release.</span>
+                ` : nothing}
+              </div>
+              <pre
+                id="code-popover-panel"
+                class="code-popover-pre"
+                tabindex="0"
+                role="tabpanel"
+                aria-labelledby=${
+                    this.codeVariant === 'html' ? 'tab-code-html' :
+                                                  'tab-code-npm'}
+              ><code class="hljs language-${
+                  this.codeVariant === 'html' ? 'html' : 'typescript'}">${
+                  renderHtml(highlight(codeSnippet, codeHighlightLang))}</code></pre>
+              <div class="code-popover-footer">
+                ${this.codeVariant === 'html' ? html`
+                  <span class="code-popover-install">Save as <code>.html</code> and open in a WebGPU browser (use localhost/https for local files &amp; caching).</span>
+                ` : html`
+                  <span class="code-popover-install"><code>${getNpmInstallCommand()}</code></span>
+                `}
+                <span class="sr-only" role="status" aria-live="polite">${this.codeCopied ? 'Copied code to clipboard' : ''}</span>
+                <a
+                  class="code-popover-docs-link"
+                  href="https://ai.google.dev/edge/litert-lm/js"
+                  target="_blank"
+                  rel="noopener noreferrer"
+                >JS API docs ↗</a>
+              </div>
+            </div>
+          ` : nothing}
+
           <div class="composer-toolbar">
             <div class="composer-tools-left">
               <div class="composer-model-anchor">
@@ -1419,8 +1709,13 @@ export class LitertChatWindow extends LitElement {
                   .value=${selectedPath}
                   @toggle-open=${(e: CustomEvent<{open: boolean}>) => {
                     this.isModelMenuOpen = e.detail.open;
-                    if (e.detail.open && this.isAddingModel) {
-                      this.closeComposerAddModel(false);
+                    if (e.detail.open) {
+                      if (this.isAddingModel) {
+                        this.closeComposerAddModel(false);
+                      }
+                      if (this.isCodePopoverOpen) {
+                        this.closeCodePopover(false);
+                      }
                     }
                   }}
                   @change=${this.handleComposerModelChange}
@@ -1511,6 +1806,23 @@ export class LitertChatWindow extends LitElement {
                   </div>
                 ` : nothing}
               </div>
+              <button
+                id="btn-get-code"
+                type="button"
+                class="btn-get-code ${this.isCodePopoverOpen ? 'open' : ''}"
+                title="Get @litert-lm/core code for this model and config"
+                aria-label="Get code"
+                aria-haspopup="dialog"
+                aria-expanded=${this.isCodePopoverOpen ? 'true' : 'false'}
+                aria-controls=${this.isCodePopoverOpen ? 'composer-code-popover' : nothing}
+                @click=${this.toggleCodePopover}
+              >
+                <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                  <polyline points="16 18 22 12 16 6"></polyline>
+                  <polyline points="8 6 2 12 8 18"></polyline>
+                </svg>
+                <span class="get-code-label">Code</span>
+              </button>
             </div>
 
             <div class="composer-tools-right">
