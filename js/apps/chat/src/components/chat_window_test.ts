@@ -1015,7 +1015,111 @@ describe('litert-chat-window', () => {
          });
     });
 
-    describe('modality disabling', () => {
+    describe('Get code popover and modality disabling', () => {
+      it('opens Get code popover with live @litert-lm/core snippet, shows Copied feedback, traps Tab, and restores focus on Escape',
+         async () => {
+           mockSettings.selectedModelPath = MODELS[0]!.path;
+           mockSettings.samplerType = 'top_k';
+           mockSettings.topK = 40;
+           mockSettings.temperature = 0.7;
+           mockSettings.visionBackend = 'off';
+           element.requestUpdate();
+           await element.updateComplete;
+
+           const codeBtn = element.shadowRoot!.querySelector<HTMLButtonElement>(
+               '#btn-get-code')!;
+           expect(codeBtn).toBeTruthy();
+           expect(codeBtn.getAttribute('aria-expanded')).toBe('false');
+
+           codeBtn.click();
+           await element.updateComplete;
+           await new Promise(resolve => requestAnimationFrame(resolve));
+
+           expect(codeBtn.getAttribute('aria-expanded')).toBe('true');
+           const popover = element.shadowRoot!.querySelector<HTMLElement>(
+               '#composer-code-popover')!;
+           expect(popover).toBeTruthy();
+           const preText =
+               popover.querySelector('.code-popover-pre')!.textContent ?? '';
+           expect(preText).toContain(`model: '${MODELS[0]!.path}'`);
+           expect(preText).toContain('max_top_k: 40');
+           expect(preText).toContain('use_autosized_ringbuffers: true');
+           expect(preText).toContain('type: SamplerType.TOP_K');
+           expect(preText).toContain('audioBackend: Backend.GPU');
+           expect(preText).not.toContain('visionBackend');
+           expect(preText).toContain(
+               '// Disables image cache allocation (defaults to 4)\n    maxNumImages: 0,');
+
+           // Unreleased build note + npm footer hint on default npm tab
+           const npmTab = popover.querySelector<HTMLButtonElement>(
+               '#tab-code-npm')!;
+           const htmlTab = popover.querySelector<HTMLButtonElement>(
+               '#tab-code-html')!;
+           expect(npmTab.getAttribute('aria-selected')).toBe('true');
+           expect(htmlTab.getAttribute('aria-selected')).toBe('false');
+           expect(popover.querySelector('#code-popover-unreleased-note')
+                      ?.textContent)
+               .toContain('Unreleased build');
+           expect(popover.querySelector('.code-popover-install')?.textContent)
+               .toContain('npm i @litert-lm/core');
+
+           const copyBtn = popover.querySelector<HTMLButtonElement>(
+               '#btn-copy-model-code')!;
+           expect(element.shadowRoot!.activeElement).toBe(copyBtn);
+
+           let clipboardSpy: jasmine.Spy|undefined;
+           if (navigator.clipboard && 'writeText' in navigator.clipboard) {
+             clipboardSpy =
+                 spyOn(navigator.clipboard, 'writeText').and.resolveTo();
+           }
+           copyBtn.click();
+           await new Promise(resolve => setTimeout(resolve, 0));
+           await element.updateComplete;
+           expect(copyBtn.textContent).toContain('Copied');
+
+           // Keyboard ArrowRight switches to HTML variant, updates footer & copy
+           // payload, and persists selection in storage across re-opens.
+           npmTab.focus();
+           npmTab.dispatchEvent(new KeyboardEvent(
+               'keydown', {key: 'ArrowRight', bubbles: true, cancelable: true}));
+           await element.updateComplete;
+           expect(htmlTab.getAttribute('aria-selected')).toBe('true');
+           expect(npmTab.getAttribute('aria-selected')).toBe('false');
+           expect(element.shadowRoot!.activeElement).toBe(htmlTab);
+           const htmlPreText =
+               popover.querySelector('.code-popover-pre')!.textContent ?? '';
+           expect(htmlPreText).toContain('<!DOCTYPE html>');
+           expect(htmlPreText).toContain('<script type="importmap">');
+           expect(popover.querySelector('.code-popover-install')?.textContent)
+               .toContain('Save as .html');
+
+           copyBtn.click();
+           await new Promise(resolve => setTimeout(resolve, 0));
+           await element.updateComplete;
+           if (clipboardSpy) {
+             expect(clipboardSpy.calls.mostRecent().args[0])
+                 .toContain('<!DOCTYPE html>');
+           }
+
+           // Escape closes the popover and restores focus to #btn-get-code
+           popover.dispatchEvent(new KeyboardEvent(
+               'keydown', {key: 'Escape', bubbles: true, cancelable: true}));
+           await element.updateComplete;
+           expect(element.shadowRoot!.querySelector('#composer-code-popover'))
+               .toBeNull();
+           expect(element.shadowRoot!.activeElement).toBe(codeBtn);
+
+           // Re-opening remembers the HTML variant from storage
+           codeBtn.click();
+           await element.updateComplete;
+           const reopened = element.shadowRoot!.querySelector<HTMLElement>(
+               '#composer-code-popover')!;
+           expect(reopened.querySelector('#tab-code-html')
+                      ?.getAttribute('aria-selected'))
+               .toBe('true');
+           window.localStorage.removeItem('litertlm-code-snippet-variant');
+         });
+
       it('disables camera, mic, and media attach buttons with explanations when Vision and/or Audio are off',
          async () => {
            const addMediaBtn =
@@ -1136,6 +1240,83 @@ describe('litert-chat-window', () => {
            expect(mockChatSession.sendMessage).not.toHaveBeenCalled();
            expect(mockState.statusText)
                .toContain('Vision is turned off in Experimental settings');
+         });
+
+      it('renders Get code popover tokens with WCAG AA >= 4.5:1 contrast in both light and dark themes across npm and HTML tabs',
+         async () => {
+           const toLinear = (c: number) => {
+             const v = c / 255;
+             return v <= 0.04045 ? v / 12.92 :
+                                   Math.pow((v + 0.055) / 1.055, 2.4);
+           };
+           const lum = (rgb: string) => {
+             const m = rgb.match(/rgba?\(\s*(\d+)\s*,\s*(\d+)\s*,\s*(\d+)/)!;
+             return 0.2126 * toLinear(Number(m[1])) +
+                 0.7152 * toLinear(Number(m[2])) +
+                 0.0722 * toLinear(Number(m[3]));
+           };
+           const contrast = (fg: string, bg: string) => {
+             const l1 = lum(fg);
+             const l2 = lum(bg);
+             return (Math.max(l1, l2) + 0.05) / (Math.min(l1, l2) + 0.05);
+           };
+
+           const prevTheme = document.documentElement.getAttribute('data-theme');
+           try {
+             const codeBtn =
+                 element.shadowRoot!.querySelector<HTMLButtonElement>(
+                     '#btn-get-code')!;
+             codeBtn.click();
+             await element.updateComplete;
+
+             const pre = element.shadowRoot!.querySelector<HTMLElement>(
+                 '.code-popover-pre')!;
+             const npmTab =
+                 element.shadowRoot!.querySelector<HTMLButtonElement>(
+                     '#tab-code-npm')!;
+             const htmlTab =
+                 element.shadowRoot!.querySelector<HTMLButtonElement>(
+                     '#tab-code-html')!;
+
+             for (const [tabName, tabBtn] of [
+                      ['npm', npmTab],
+                      ['html', htmlTab],
+                  ] as const) {
+               tabBtn.click();
+               await element.updateComplete;
+
+               document.documentElement.setAttribute('data-theme', 'light');
+               const lightBg = getComputedStyle(pre).backgroundColor;
+               expect(lightBg).toBe('rgb(241, 245, 249)');
+               const spans = Array.from(
+                   pre.querySelectorAll<HTMLElement>(
+                       '.hljs, [class*="hljs-"]'));
+               expect(spans.length).toBeGreaterThan(5);
+               const lightSampleColor = getComputedStyle(spans[1]!).color;
+               for (const span of spans) {
+                 expect(contrast(getComputedStyle(span).color, lightBg))
+                     .withContext(`light ${tabName} ${span.className}`)
+                     .toBeGreaterThanOrEqual(4.5);
+               }
+
+               document.documentElement.setAttribute('data-theme', 'dark');
+               const darkBg = getComputedStyle(pre).backgroundColor;
+               expect(darkBg).toBe('rgb(8, 11, 16)');
+               expect(getComputedStyle(spans[1]!).color)
+                   .not.toBe(lightSampleColor);
+               for (const span of spans) {
+                 expect(contrast(getComputedStyle(span).color, darkBg))
+                     .withContext(`dark ${tabName} ${span.className}`)
+                     .toBeGreaterThanOrEqual(4.5);
+               }
+             }
+           } finally {
+             if (prevTheme === null) {
+               document.documentElement.removeAttribute('data-theme');
+             } else {
+               document.documentElement.setAttribute('data-theme', prevTheme);
+             }
+           }
          });
     });
   });
